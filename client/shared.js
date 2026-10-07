@@ -17,6 +17,53 @@ var SETTINGS_ENTRY = 'cosyvoice'
 /** 必须等于包名：boot-graph 的行 id 就是注册键。 */
 var PLUGIN_ID = 'dsh-cosyvoice'
 
+/** 非实时：整段一次合成后再播。 */
+var MODE_ONE_SHOT = 'one-shot'
+
+/** 实时：SSE 边合成边播。 */
+var MODE_STREAM = 'stream'
+
+/** 合成方式存在浏览器本地的键；它是"点了立刻生效"的那一份。 */
+var MODE_KEY = 'dsh-cosyvoice.mode'
+
+/** localStorage 不可用时（无痕模式、沙箱）兜在这一份里，页面内仍然能切换。 */
+var modeMemory = ''
+
+/**
+ * 当前想要的合成方式。
+ *
+ * 存在本地而不是只读配置镜像，是因为写配置要走一趟宿主通道（有时还会因为 schema
+ * 没重载而被拒），而"点了一下没反应"是最差的体验 —— 这里先让它立刻生效，配置的
+ * 写入再异步去试，失败也只是提示，不影响这一次播放。
+ * @returns `stream` / `one-shot` / `''`（没选过，交给服务端配置决定）。
+ */
+function readMode() {
+  try {
+    var stored = window.localStorage === undefined || window.localStorage === null
+      ? ''
+      : window.localStorage.getItem(MODE_KEY)
+    if (stored === MODE_STREAM || stored === MODE_ONE_SHOT) return stored
+  } catch (error) {
+    // 读不到就当没选过。
+  }
+  return modeMemory
+}
+
+/**
+ * 记住当前选择的合成方式。
+ * @param value - `stream` / `one-shot`。
+ */
+function saveMode(value) {
+  modeMemory = value === MODE_STREAM ? MODE_STREAM : MODE_ONE_SHOT
+  try {
+    if (window.localStorage !== undefined && window.localStorage !== null) {
+      window.localStorage.setItem(MODE_KEY, modeMemory)
+    }
+  } catch (error) {
+    // 存不下也不影响这一页。
+  }
+}
+
 /** 主机名主题 token，每个都带兜底，缺 token 时降级而不是变空白。 */
 var T = {
   text: 'var(--dsw-alias-label-primary, inherit)',
@@ -416,12 +463,21 @@ async function readSseFrames(body, onFrame) {
  */
 async function speakAs(action, body, messageId) {
   player.loading(messageId)
+  var payload = {}
+  if (body !== undefined && body !== null) {
+    for (var key in body) if (Object.prototype.hasOwnProperty.call(body, key)) payload[key] = body[key]
+  }
+  // 带上"我现在想要的模式"：服务端只在它合法时才听它的，否则仍按自己的配置来。
+  // 于是切换是**当场生效**的，不必等宿主把配置写回去。
+  var wanted = readMode()
+  if (wanted !== '') payload.mode = wanted
+
   var response
   try {
     response = await fetch(ROUTE_PREFIX + '/' + action, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(body === undefined ? {} : body),
+      body: JSON.stringify(payload),
     })
   } catch (error) {
     player.fail(messageId, String(error))

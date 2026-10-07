@@ -472,6 +472,53 @@ describe('实时（流式）合成路由', () => {
     assert.match((await json(response)).message, /没有可朗读的文本/)
   })
 
+  it('请求里带的 mode 当场覆盖配置：整段服务器也能出 SSE', async () => {
+    // 用户点击切换后必须**这一次**就生效，而不是等宿主把配置写回去 —— 配置通道
+    // 迟迟不落（或 schema 没跟着重载）时，等待就表现为"点了没反应"。
+    const response = await realFetch(`${base}/dsh-cosyvoice/speak`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ text: '临时的实时请求', mode: 'stream' }),
+    })
+    assert.match(String(response.headers.get('content-type')), /text\/event-stream/)
+    const text = await response.text()
+    const chunks = dataLines(text, 'chunk')
+    assert.equal(chunks.length, 2)
+    assert.deepEqual(Buffer.from(chunks[0].audio, 'base64'), PCM_ONE)
+  })
+
+  it('带 one-shot 时实时服务器也回到整段 JSON', async () => {
+    const spoken = await json(await realFetch(`${streamBase}/dsh-cosyvoice/speak`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ text: '临时的整段请求', mode: 'one-shot' }),
+    }))
+    assert.equal(spoken.mode, 'one-shot')
+    assert.equal(spoken.clip.name.endsWith('.mp3'), true)
+    const audio = await realFetch(`${streamBase}${spoken.clip.url}`)
+    assert.equal(audio.headers.get('content-type'), 'audio/mpeg')
+  })
+
+  it('不认识的 mode 不生效，仍按配置走', async () => {
+    const response = await realFetch(`${streamBase}/dsh-cosyvoice/speak`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ text: '胡乱给一个模式', mode: 'realtime' }),
+    })
+    assert.match(String(response.headers.get('content-type')), /text\/event-stream/)
+  })
+
+  it('/status 按问上来的 mode 报"真正会生效的那个"，并单独给配置值', async () => {
+    const asStream = await json(await realFetch(`${base}/dsh-cosyvoice/status?mode=stream`))
+    assert.equal(asStream.mode, 'stream')
+    // 配置里写的是 one-shot，这一行把它如实报出来，于是页面能说明"已生效但未保存"。
+    assert.equal(asStream.configuredMode, 'one-shot')
+
+    const plain = await json(await realFetch(`${base}/dsh-cosyvoice/status`))
+    assert.equal(plain.mode, 'one-shot')
+    assert.equal(plain.configuredMode, 'one-shot')
+  })
+
   it('流式与非流式的缓存各占一个文件名，互不覆盖', async () => {
     const text = '两条链路各自缓存'
     const once = await json(await realFetch(`${base}/dsh-cosyvoice/speak`, {

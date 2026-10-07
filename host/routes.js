@@ -187,10 +187,19 @@ function sendFrame(res, event, data) {
  */
 export function cosyvoiceRoutes({ getSettings, synth, store, texts, profiles, cloner, bootClip, openDir, log }) {
   /**
-   * 当前生效的合成方式。每次都读 —— 切换模式不需要重启。
+   * 本次请求要用的合成方式。
+   *
+   * 配置是**默认值**，而请求里带的那个是"用户刚刚点的"：宿主的配置通道要绕一趟
+   * （写入、校验、重载插件），有时还会因为 schema 没跟着更新而写不进去 —— 让那
+   * 种情况把按钮变成"点了没反应"是不可接受的。所以只要请求给了合法值就听它的。
+   * @param explicit - 请求体里的 `mode`；不合法（含没给）时回落到配置。
    * @returns {@link import('./settings.js').MODE_STREAM} 或 {@link import('./settings.js').MODE_ONE_SHOT}。
    */
-  const modeOf = () => normalizeMode((getSettings() ?? {}).mode)
+  const modeOf = (explicit) => {
+    const wanted = String(explicit ?? '').trim()
+    if (wanted === MODE_STREAM || wanted === MODE_ONE_SHOT) return wanted
+    return normalizeMode((getSettings() ?? {}).mode)
+  }
 
   /**
    * 给一段音频补上浏览器该去取的 URL。
@@ -245,10 +254,12 @@ export function cosyvoiceRoutes({ getSettings, synth, store, texts, profiles, cl
    * 统一的合成出口：整段文本一次合成、一次返回。
    * @param res - 响应。
    * @param text - 要朗读的文本。
+   * @param wanted - 请求里指定的合成方式；省略则按配置。
    */
-  const respond = async (res, text) => {
+  const respond = async (res, text, wanted) => {
+    const mode = modeOf(wanted)
     try {
-      if (modeOf() === MODE_STREAM) return await streamInto(res, text)
+      if (mode === MODE_STREAM) return await streamInto(res, text)
       const clip = await synth.synthesize(text)
       return sendJson(res, 200, { ok: true, mode: MODE_ONE_SHOT, clip: describe(clip) })
     } catch (error) {
@@ -287,6 +298,9 @@ export function cosyvoiceRoutes({ getSettings, synth, store, texts, profiles, cl
       path: `${ROUTE_PREFIX}/status`,
       handler(req, res) {
         const settings = getSettings() ?? {}
+        // 允许问"按某个模式来算，会是怎么回事"：设置页把自己的选择带上来，于是
+        // 它显示的是**真正会生效的那个值**，而不是配置文档里那一行。
+        const wanted = new URL(req.url ?? '/', 'http://localhost').searchParams.get('mode')
         // 报的是"真正会生效的那一套"（档案优先于回退值），否则用户切了音色，
         // 状态页却还在说旧的那套，试听与播放用的又不是同一个。
         const identity = synth.identity()
@@ -297,7 +311,8 @@ export function cosyvoiceRoutes({ getSettings, synth, store, texts, profiles, cl
           model: identity.model,
           voiceId: identity.voiceId,
           profileId: identity.profileId ?? '',
-          mode: modeOf(),
+          mode: modeOf(wanted),
+          configuredMode: modeOf(),
           bootSound: settings.bootSound === true,
           dir: store.dir(),
           count: store.count(),
@@ -501,7 +516,7 @@ export function cosyvoiceRoutes({ getSettings, synth, store, texts, profiles, cl
         }
         // 客户端给的文本顺手登记，下次点击连 DOM 都不用读。
         if (supplied !== '' && messageId !== '') texts.remember(messageId, supplied)
-        return respond(res, text)
+        return respond(res, text, body.mode)
       },
     },
     {
@@ -513,7 +528,7 @@ export function cosyvoiceRoutes({ getSettings, synth, store, texts, profiles, cl
         const body = await readJson(req)
         if (body === undefined) return sendJson(res, 400, { ok: false, message: '请求体不是合法 JSON' })
         const text = typeof body.text === 'string' ? body.text : ''
-        return respond(res, text)
+        return respond(res, text, body.mode)
       },
     },
     {

@@ -178,9 +178,15 @@ function CosyvoiceSettingsPage(props) {
 
   var value = (snapshot && snapshot.value) || {}
   var hasSecret = !!(snapshot && snapshot.user && typeof snapshot.user === 'object' && 'apiKey' in snapshot.user)
-  // 与宿主同一个归一规则：只有 `stream` 认作实时，写错配置的人得到一个能出声的
-  // 默认值，而不是一片空白。
-  var mode = String(value.mode || '') === 'stream' ? 'stream' : 'one-shot'
+  // 合成方式有两个来源：**本地那一份优先** —— 它是"点了这一次"的结果，而配置
+  // 镜像要等宿主把写入跑完才变。于是切换当场就能看见，写配置失败也不会把按钮
+  // 变成"点了没反应"。
+  var modeState = React.useState(readMode())
+  var setMode = modeState[1]
+  // 没在本地选过（初次安装）时，以配置镜像为准；之后一律听本地那一份。
+  var mode = modeState[0] === ''
+    ? (String(value.mode || '') === 'stream' ? 'stream' : 'one-shot')
+    : modeState[0]
 
   var statusState = React.useState(null)
   var status = statusState[0]
@@ -355,12 +361,20 @@ function CosyvoiceSettingsPage(props) {
     })
   }
 
+  // 把自己的选择带上去问，于是拿回来的是"按这个选择真正会走哪条路"，而不是
+  // 配置文档里那一行 —— 两者不一致时（配置没写进去）页面会明确说出来。
   React.useEffect(function () {
-    rpc('status').then(function (res) {
+    rpc('status?mode=' + encodeURIComponent(mode)).then(function (res) {
       if (res === undefined || !res.ok) return
-      setCount({ count: res.count, dir: res.dir, configured: res.configured })
+      setCount({
+        count: res.count,
+        dir: res.dir,
+        configured: res.configured,
+        mode: res.mode,
+        configuredMode: res.configuredMode,
+      })
     })
-  }, [snapshot])
+  }, [snapshot, mode])
 
   /**
    * 试听：走一次真实合成，所以能一次性验出 Key、模型与音色是否匹配。
@@ -408,6 +422,37 @@ function CosyvoiceSettingsPage(props) {
   }
 
   /**
+   * 切换合成方式。
+   *
+   * 先本地生效（于是这一下**一定有反应**），再去试着把它写进宿主配置：写进去
+   * 就持久化，写不进去（schema 还没跟着更新、或通道临时不可用）也在页面上说
+   * 出来，而不是静默失败 —— 用户上一次遇到的正是"点了没变化也不知道为什么"。
+   * @param target - 要切到的模式。
+   */
+  function switchMode(target) {
+    setMode(target)
+    saveMode(target)
+    setStatus(null)
+    // 走 form.set 而不是那个静默的 `write()`：这里的失败**必须**让人看见。
+    var done
+    try {
+      done = form.set('mode', target)
+    } catch (error) {
+      setStatus({ kind: 'error', message: t('settings.modeFailed') })
+      console.error('[dsh-cosyvoice] 写入合成方式失败：', error)
+      return
+    }
+    if (done !== undefined && done !== null && typeof done.then === 'function') {
+      done.then(function () {
+        setStatus({ kind: 'ok', message: t('settings.modeSaved') })
+      }).catch(function (error) {
+        setStatus({ kind: 'error', message: t('settings.modeFailed') })
+        console.error('[dsh-cosyvoice] 写入合成方式失败：', error)
+      })
+    }
+  }
+
+  /**
    * 模式切换里的一个按钮。
    * @param target - 它代表的模式。
    * @param labelKey - 文案键。
@@ -420,7 +465,7 @@ function CosyvoiceSettingsPage(props) {
       type: 'button',
       'aria-pressed': active,
       style: active ? MODE_BUTTON_ACTIVE : MODE_BUTTON,
-      onClick: function () { write('mode', target) },
+      onClick: function () { switchMode(target) },
     }, t(labelKey))
   }
 
@@ -568,6 +613,14 @@ function CosyvoiceSettingsPage(props) {
       modeButton('one-shot', 'settings.modeOnce'),
       modeButton('stream', 'settings.modeStream'),
     ]),
+    // 宿主那边真正会走哪条路：点了按钮却看不到它变化，就只能靠这一行来说明。
+    count === null || count.mode === undefined
+      ? null
+      : React.createElement('div', { style: HINT },
+        t('settings.modeEffective') + '：' + (count.mode === 'stream'
+          ? t('settings.modeStream')
+          : t('settings.modeOnce'))
+        + (count.configuredMode === count.mode ? '' : ' · ' + t('settings.modeUnsaved'))),
     profilesBlock,
     // 其余字段同样是"失焦即写入"：每敲一个字符都发一次写请求会把 revision 用光，
     // 而且中间态（半个 Key）本身也不是一个合法配置。

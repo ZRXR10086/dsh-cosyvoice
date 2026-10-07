@@ -1,6 +1,6 @@
 {
   "name": "dsh-cosyvoice",
-  "version": "2.1.0",
+  "version": "2.1.1",
   "description": "为 DeepSeek Harness 网页界面的每条 AI 回答加一个语音播放键：点击即用阿里云百炼 CosyVoice 音色朗读该回答。V2 增加音色档案、音色克隆（上传音频自动获得音色 ID）；v2.1 提供实时（流式）与非实时（整段）两种合成方式，可在设置页切换。",
   "type": "module",
   "license": "MIT",
