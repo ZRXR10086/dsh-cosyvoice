@@ -34,18 +34,45 @@ var T = {
  * 永不抛异常：失败的调用 resolve 成 `{ ok: false, message }`，于是渲染路径不会
  * 因为一次瞬时宿主错误而崩掉。
  * @param action - 插件前缀下的路由名（例如 `speak-message`）。
- * @param body - POST 的 JSON body；省略即 GET。
+ * @param body - JSON body；省略即 GET。
+ * @param method - 覆盖 HTTP 方法（档案的删除用 DELETE）。
  * @returns 解析后的响应，或失败信封。
  */
-async function rpc(action, body) {
+async function rpc(action, body, method) {
   try {
-    const response = await fetch(ROUTE_PREFIX + '/' + action, body === undefined
-      ? { method: 'GET' }
-      : {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify(body),
-        })
+    const response = await fetch(ROUTE_PREFIX + '/' + action, {
+      method: method ?? (body === undefined ? 'GET' : 'POST'),
+      headers: body === undefined ? undefined : { 'content-type': 'application/json' },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    })
+    const text = await response.text()
+    if (text === '') return { ok: response.ok }
+    try {
+      return JSON.parse(text)
+    } catch (error) {
+      return { ok: false, message: '返回内容不是合法 JSON' }
+    }
+  } catch (error) {
+    return { ok: false, message: String(error) }
+  }
+}
+
+/**
+ * 上传一段字节并取回 JSON（音色克隆用）。
+ *
+ * 与 {@link rpc} 一样永不抛异常，于是"上传失败"不会把设置页掀翻。
+ * @param action - 插件前缀下的路由名。
+ * @param query - 查询串（已编码）。
+ * @param bytes - 要送出去的字节。
+ * @returns 解析后的响应，或失败信封。
+ */
+async function rpcBytes(action, query, bytes) {
+  try {
+    const response = await fetch(`${ROUTE_PREFIX}/${action}?${query}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/octet-stream' },
+      body: bytes,
+    })
     const text = await response.text()
     if (text === '') return { ok: response.ok }
     try {
@@ -70,6 +97,18 @@ var player = (function () {
   var listeners = []
   var audio = null
 
+  /**
+   * 当前播放队列。
+   *
+   * 回答是按句子分段的：首句一就绪就开始播，其余在后台继续合成。队列里存的是
+   * **已经拿到 URL 的那几句**，`done` 说明后面不会再有，`index` 是正在播的那句。
+   * @type {{ messageId: string, jobId: string, segments: Array, done: boolean, index: number, error?: string } | null}
+   */
+  var queue = null
+
+  /** 后台续句的轮询定时器。 */
+  var pollTimer = null
+
   function emit() {
     for (var i = 0; i < listeners.length; i += 1) listeners[i]()
   }
@@ -84,7 +123,136 @@ var player = (function () {
     emit()
   }
 
+  function clearPoll() {
+    if (pollTimer === null) return
+    clearTimeout(pollTimer)
+    pollTimer = null
+  }
+
+  /** 丢掉队列（停止播放、关掉轮询）。 */
+  function dropQueue() {
+    clearPoll()
+    queue = null
+  }
+
+  /**
+   * 预加载下一句。
+   *
+   * 句间的几百毫秒是最容易被听出来的卡顿，而下一句的 URL 此时通常已经拿到了，
+   * 所以趁现在让浏览器把字节取回来。
+   * @param url - 下一句的地址。
+   */
+  function preload(url) {
+    try {
+      var next = new Audio()
+      next.preload = 'auto'
+      next.src = url
+    } catch (error) {
+      // 预加载失败不影响播放本身：真到那句时会重新取。
+    }
+  }
+
+  /**
+   * 播放队列里的第 index 句。
+   * @param index - 句序号。
+   */
+  function playAt(index) {
+    if (queue === null) return
+    queue.index = index
+
+    if (index >= queue.segments.length) {
+      // 还没合成出来：播完了但还有后续，就停在"合成中"等轮询把新句子接上。
+      if (queue.done) {
+        if (typeof queue.error === 'string' && queue.error !== '') {
+          set({ kind: 'error', messageId: queue.messageId, message: queue.error })
+        } else {
+          set({ idle: true })
+        }
+        dropQueue()
+        return
+      }
+      set({ kind: 'loading', messageId: queue.messageId })
+      schedulePoll(0)
+      return
+    }
+
+    var audio = element()
+    audio.pause()
+    audio.src = queue.segments[index].url
+    audio.currentTime = 0
+    set({ kind: 'loading', messageId: queue.messageId })
+    preload(queue.segments[index + 1] === undefined ? undefined : queue.segments[index + 1].url)
+    var started = audio.play()
+    if (started && typeof started.then === 'function') {
+      started.then(function () {
+        // 只有这个队列还在播才更新状态：用户可能已经点停或切到别的消息了。
+        if (queue !== null && queue.index === index) set({ kind: 'playing', messageId: queue.messageId })
+      }).catch(function () {
+        if (queue !== null && queue.index === index) {
+          set({ kind: 'error', messageId: queue.messageId, message: '浏览器拒绝了自动播放，请再点一次' })
+        }
+        dropQueue()
+      })
+    } else {
+      set({ kind: 'playing', messageId: queue.messageId })
+    }
+    audio.onended = function () {
+      if (queue === null || queue.index !== index) return
+      playAt(index + 1)
+    }
+    audio.onerror = function () {
+      if (queue === null || queue.index !== index) return
+      set({ kind: 'error', messageId: queue.messageId, message: '音频播放失败' })
+      dropQueue()
+    }
+  }
+
+  /**
+   * 安排一次"去后台取新句子"的轮询。
+   * @param delayMs - 延迟毫秒数。
+   */
+  function schedulePoll(delayMs) {
+    if (queue === null) return
+    clearPoll()
+    pollTimer = setTimeout(function () {
+      pollTimer = null
+      if (queue === null) return
+      rpc('segments?job=' + encodeURIComponent(queue.jobId)).then(function (res) {
+        if (queue === null) return
+        if (res === undefined || !res.ok) {
+          set({ kind: 'error', messageId: queue.messageId, message: (res && res.message) || '语音合成失败' })
+          dropQueue()
+          return
+        }
+        queue.segments = res.segments === undefined ? queue.segments : res.segments
+        queue.done = res.done === true
+        if (typeof res.error === 'string' && res.error !== '') queue.error = res.error
+        // 队列补上了就接着播；还没补上就继续等。
+        if (queue.index < queue.segments.length) playAt(queue.index)
+        else if (queue.done) playAt(queue.index)
+        else schedulePoll(500)
+      })
+    }, delayMs)
+  }
+
   return {
+    /**
+     * 开始播一个分句队列。
+     * @param messageId - 归属消息。
+     * @param job - 服务端给的作业视图 `{ jobId, segments, done, error }`。
+     */
+    startQueue: function (messageId, job) {
+      dropQueue()
+      queue = {
+        messageId: messageId,
+        jobId: String(job.jobId === undefined ? '' : job.jobId),
+        segments: Array.isArray(job.segments) ? job.segments : [],
+        done: job.done === true,
+        index: 0,
+        error: typeof job.error === 'string' ? job.error : undefined,
+      }
+      playAt(0)
+    },
     /** @returns 当前状态快照。 */
     getSnapshot: function () { return state },
     /** @param listener - 变更回调。 @returns 取消订阅函数。 */
@@ -102,6 +270,7 @@ var player = (function () {
      */
     play: function (messageId, url) {
       const audio = element()
+      dropQueue()
       audio.pause()
       audio.src = url
       audio.currentTime = 0
@@ -121,9 +290,10 @@ var player = (function () {
         set({ kind: 'error', messageId: messageId, message: '音频播放失败' })
       }
     },
-    /** 停止播放。 */
+    /** 停止播放：连同队列与轮询一起收掉。 */
     stop: function () {
       const audio = element()
+      dropQueue()
       audio.pause()
       audio.onended = null
       audio.onerror = null
@@ -134,6 +304,7 @@ var player = (function () {
      * @param messageId - 目标消息。
      */
     loading: function (messageId) {
+      dropQueue()
       set({ kind: 'loading', messageId: messageId })
     },
     /**

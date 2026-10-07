@@ -26,24 +26,41 @@ export class VoiceSynthesizer {
    * @param options.speech - 云端合成客户端。
    * @param options.store - 音频目录与缓存。
    * @param options.getSettings - 每次调用都读当前设置。
+   * @param options.profiles - 音色档案；省略时固定走设置里的回退值。
    * @param options.log - 诊断输出（不进响应）。
    */
-  constructor({ speech, store, getSettings, log }) {
+  constructor({ speech, store, getSettings, profiles, log }) {
     this.speech = speech
     this.store = store
     this.getSettings = getSettings
+    this.profiles = profiles
     this.log = log ?? (() => {})
   }
 
   /**
-   * 当前生效的缓存键参数（模型 + 音色）。
-   * @returns 模型与音色。
+   * 当前生效的（模型 + 音色）。
+   *
+   * 优先取**激活的音色档案**：档案表达的是"现在用哪一套"，而设置里的
+   * `voiceId` / `model` 在 v2 已经降级成"一套档案都没有"时的回退值，这样
+   * v1 用户升级上来不需要重新配置就能继续用。
+   *
+   * 档案存在但音色 ID 还是空的（克隆中）时不作数，否则每次合成都会拿一个空
+   * 音色去打云端，报错还难懂。
+   * @returns 模型、音色，以及命中档案时的档案 id / 名称。
    */
   identity() {
     const settings = this.getSettings() ?? {}
-    return {
+    const fallback = {
       model: String(settings.model ?? '').trim(),
       voiceId: String(settings.voiceId ?? '').trim(),
+    }
+    const profile = this.profiles === undefined ? undefined : this.profiles.active()
+    if (profile === undefined || profile.voiceId === '') return fallback
+    return {
+      model: profile.model === '' ? fallback.model : profile.model,
+      voiceId: profile.voiceId,
+      profileId: profile.id,
+      profileName: profile.name,
     }
   }
 
@@ -69,7 +86,7 @@ export class VoiceSynthesizer {
     // 长文本在清洗后才截断，所以缓存键算的是"真正会发出去的内容"——
     // 否则同一段超长文本在截断前后会算出两个键，白付一次钱。
     const clipped = text.length > MAX_TEXT_CHARS ? text.slice(0, MAX_TEXT_CHARS) : text
-    const result = await this.speech.synthesize(clipped)
+    const result = await this.speech.synthesize(clipped, { model, voiceId })
     const clip = this.store.put(key, result.bytes)
     this.log(`synth: 已合成 ${clip.name}（${String(clip.bytes)} 字节，计费 ${String(result.characters)} 字符）`)
     return { ...clip, cached: false, text: clipped, characters: result.characters }

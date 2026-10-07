@@ -44,6 +44,15 @@ async function json(response) {
   return JSON.parse(await response.text())
 }
 
+/**
+ * 一个假的百炼响应。
+ * @param payload - 响应体。
+ * @returns 响应。
+ */
+function fake(payload) {
+  return { ok: true, status: 200, text: async () => JSON.stringify(payload) }
+}
+
 let home
 let server
 let base
@@ -114,15 +123,28 @@ before(async () => {
   process.env.DSH_HOME = home
 
   // 假 fetch：合成请求返回一段固定音频（`SpeechClient` 默认读全局 fetch）。
+  // 音色克隆打的是另外两个端点，所以这里按 URL 分派 —— 于是"上传 → 取内网地址 →
+  // 注册 → 查询就绪"整条链也是在不联网的前提下验证的。
   realFetch = globalThis.fetch
-  globalThis.fetch = async () => ({
-    ok: true,
-    status: 200,
-    text: async () => JSON.stringify({
+  globalThis.fetch = async (url, init) => {
+    const target = String(url ?? '')
+    if (target.includes('/api/v1/files')) {
+      return fake(init?.body === undefined
+        ? { data: { url: 'https://intranet.example.com/a.wav' } }
+        : { data: { uploaded_files: [{ file_id: 'file-1' }] } })
+    }
+    if (target.includes('customization')) {
+      const body = JSON.parse(String(init?.body ?? '{}'))
+      const action = body?.input?.action
+      if (action === 'create_voice') return fake({ output: { voice_id: 'cosyvoice-v3.5-plus-dsh-ab12cd' } })
+      if (action === 'query_voice') return fake({ output: { voice_id: body.input.voice_id, status: 'OK' } })
+      return fake({ output: { voice_list: [{ voice_id: 'cosyvoice-v3.5-plus-cloud1', status: 'OK' }] } })
+    }
+    return fake({
       output: { audio: { data: FAKE_AUDIO.toString('base64') } },
       usage: { characters: 5 },
-    }),
-  })
+    })
+  }
 
   const plugin = await import('../host/index.js')
   const routes = []
@@ -172,22 +194,25 @@ describe('apply', () => {
 })
 
 describe('合成路由', () => {
-  it('/speak 合成并落盘，/audio 取回同样的字节', async () => {
+  it('/speak 分句合成并落盘，/audio 取回同样的字节', async () => {
     const spoken = await json(await realFetch(`${base}/dsh-cosyvoice/speak`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ text: '第一条回答' }),
+      body: JSON.stringify({ text: '这是第一条足够长的回答内容，用来验证分句。这是第二条同样足够长的回答内容。' }),
     }))
     assert.equal(spoken.ok, true)
-    assert.equal(spoken.clip.cached, false)
+    assert.equal(spoken.total, 2)
+    // 首句就绪就返回，所以响应里可能只有一段；后面几段由 /segments 续上。
+    assert.ok(spoken.segments.length >= 1)
+    assert.equal(spoken.segments[0].cached, false)
 
-    const audio = await realFetch(`${base}${spoken.clip.url}`)
+    const audio = await realFetch(`${base}${spoken.segments[0].url}`)
     assert.equal(audio.headers.get('content-type'), 'audio/mpeg')
     const bytes = Buffer.from(await audio.arrayBuffer())
     assert.deepEqual(bytes, FAKE_AUDIO)
   })
 
-  it('同一段文本第二次直接命中缓存', async () => {
+  it('同一段文本第二次直接命中句子级缓存', async () => {
     const first = await json(await realFetch(`${base}/dsh-cosyvoice/speak`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -198,9 +223,9 @@ describe('合成路由', () => {
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ text: '缓存测试' }),
     }))
-    assert.equal(first.clip.cached, false)
-    assert.equal(second.clip.cached, true)
-    assert.equal(second.clip.name, first.clip.name)
+    assert.equal(first.segments[0].cached, false)
+    assert.equal(second.segments[0].cached, true)
+    assert.equal(second.segments[0].name, first.segments[0].name)
   })
 
   it('/speak-message 用客户端给的文本，并记住它', async () => {
@@ -218,7 +243,32 @@ describe('合成路由', () => {
       body: JSON.stringify({ messageId: 'm-fresh', sessionId: 's1' }),
     }))
     assert.equal(again.ok, true)
-    assert.equal(again.clip.name, spoken.clip.name)
+    assert.equal(again.segments[0].name, spoken.segments[0].name)
+  })
+
+  it('/segments 能把后台补齐的句子续上，查不到任务时给 404', async () => {
+    const spoken = await json(await realFetch(`${base}/dsh-cosyvoice/speak`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ text: '第一句话要足够长才会被切开。第二句话同样需要足够长。第三句话也是一样足够长。第四句话依然足够长。' }),
+    }))
+    const jobId = spoken.jobId
+    assert.equal(typeof jobId, 'string')
+    assert.equal(spoken.total, 4)
+
+    // 等后台把剩下的句子合成完（假 fetch 是瞬时的，但作业是异步跑的）。
+    let view = spoken
+    for (let i = 0; i < 20 && !view.done; i += 1) {
+      await new Promise(resolve => setTimeout(resolve, 20))
+      view = await json(await realFetch(`${base}/dsh-cosyvoice/segments?job=${encodeURIComponent(jobId)}`))
+    }
+    assert.equal(view.done, true)
+    assert.equal(view.segments.length, 4)
+    // 顺序必须和原文一致：乱序填满的槽位对外仍是按序交付的。
+    assert.equal(view.segments[0].name, spoken.segments[0].name)
+
+    const missing = await realFetch(`${base}/dsh-cosyvoice/segments?job=nope`)
+    assert.equal(missing.status, 404)
   })
 
   it('/speak-message 取不到文本时给 404 和可读提示', async () => {
@@ -261,5 +311,167 @@ describe('合成路由', () => {
     })
     assert.equal(response.status, 500)
     assert.match((await json(response)).message, /没有可朗读的文本/)
+  })
+})
+
+describe('音色档案路由', () => {
+  /** POST 一个 JSON，返回解析后的响应与状态码。 */
+  async function post(action, body) {
+    const response = await realFetch(`${base}/dsh-cosyvoice/${action}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body ?? {}),
+    })
+    return { status: response.status, body: await json(response) }
+  }
+
+  /** DELETE 一个 JSON，返回解析后的响应与状态码。 */
+  async function del(body) {
+    const response = await realFetch(`${base}/dsh-cosyvoice/profiles`, {
+      method: 'DELETE',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body ?? {}),
+    })
+    return { status: response.status, body: await json(response) }
+  }
+
+  it('新增 → 列表 → 启用 → 删除 的完整往返', async () => {
+    const first = await post('profiles', { name: '档案甲', voiceId: 'voice-a', model: 'cosyvoice-v3.5-plus' })
+    assert.equal(first.status, 200)
+    assert.equal(first.body.profiles.length, 1)
+    // 第一套自动成为当前音色，于是保存完立刻就能试听。
+    assert.equal(first.body.activeId, first.body.profiles[0].id)
+
+    const second = await post('profiles', { name: '档案乙', voiceId: 'voice-b', model: 'cosyvoice-v3.5-flash' })
+    assert.equal(second.body.profiles.length, 2)
+    assert.equal(second.body.activeId, first.body.profiles[0].id)
+
+    const activated = await post('profiles/activate', { id: second.body.profiles[1].id })
+    assert.equal(activated.body.activeId, second.body.profiles[1].id)
+
+    const listed = await json(await realFetch(`${base}/dsh-cosyvoice/profiles`))
+    assert.equal(listed.ok, true)
+    assert.equal(listed.profiles.length, 2)
+    assert.deepEqual(listed.fallback, { model: 'cosyvoice-v3.5-plus', voiceId: 'voice-1' })
+
+    const removed = await del({ id: listed.profiles[1].id })
+    assert.equal(removed.body.profiles.length, 1)
+    // 删掉的正是当前音色，于是退回剩下那一条而不是变成"没有音色"。
+    assert.equal(removed.body.activeId, listed.profiles[0].id)
+
+    await del({ id: listed.profiles[0].id })
+    const emptied = await json(await realFetch(`${base}/dsh-cosyvoice/profiles`))
+    assert.equal(emptied.profiles.length, 0)
+    assert.equal(emptied.activeId, '')
+  })
+
+  it('启用档案后 /status 与合成都用档案里的音色', async () => {
+    const saved = await post('profiles', { name: '档案丙', voiceId: 'voice-profile', model: 'model-profile' })
+    assert.equal(saved.body.activeId, saved.body.profiles[0].id)
+
+    const status = await json(await realFetch(`${base}/dsh-cosyvoice/status`))
+    assert.equal(status.voiceId, 'voice-profile')
+    assert.equal(status.model, 'model-profile')
+    assert.equal(status.profileId, saved.body.profiles[0].id)
+    assert.equal(status.configured, true)
+
+    await del({ id: saved.body.profiles[0].id })
+    const back = await json(await realFetch(`${base}/dsh-cosyvoice/status`))
+    assert.equal(back.voiceId, 'voice-1')
+  })
+
+  it('缺音色 ID 得 400，启用不存在的档案得 404', async () => {
+    const noVoice = await post('profiles', { name: '没有音色', voiceId: '   ' })
+    assert.equal(noVoice.status, 400)
+    assert.match(noVoice.body.message, /音色 ID 不能为空/)
+
+    const missing = await post('profiles/activate', { id: '不存在的 id' })
+    assert.equal(missing.status, 404)
+
+    const badJson = await realFetch(`${base}/dsh-cosyvoice/profiles`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{ 这不是 JSON',
+    })
+    assert.equal(badJson.status, 400)
+  })
+})
+
+describe('音色克隆路由', () => {
+  /** POST 一段裸音频字节。 */
+  async function upload(body, query = '') {
+    const response = await realFetch(`${base}/dsh-cosyvoice/clone${query}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/octet-stream' },
+      body,
+    })
+    return { status: response.status, body: await json(response) }
+  }
+
+  it('上传音频 → 得到音色 ID → 轮询就绪 → 自动设为当前音色', async () => {
+    const made = await upload(Buffer.from('RIFF-fake-wav'), '?name=' + encodeURIComponent('我的声音') + '&filename=my.wav')
+    assert.equal(made.status, 200)
+    assert.equal(made.body.profile.source, 'clone')
+    assert.equal(made.body.profile.voiceId, 'cosyvoice-v3.5-plus-dsh-ab12cd')
+    // 刚注册完还没部署好，所以是 pending —— 但用户此刻就该在列表里看见它。
+    assert.equal(made.body.profile.status, 'pending')
+    assert.equal(made.body.profile.name, '我的声音')
+
+    const polled = await json(await realFetch(`${base}/dsh-cosyvoice/clone/status?id=${encodeURIComponent(made.body.profile.id)}`))
+    assert.equal(polled.ok, true)
+    assert.equal(polled.phase, 'ready')
+    // 就绪即落盘，并自动设为当前音色：用户上传一段音频，默认就是想用它。
+    assert.equal(polled.activeId, made.body.profile.id)
+    const stored = polled.profiles.find(item => item.id === made.body.profile.id)
+    assert.equal(stored.status, 'ready')
+
+    const status = await json(await realFetch(`${base}/dsh-cosyvoice/status`))
+    assert.equal(status.voiceId, 'cosyvoice-v3.5-plus-dsh-ab12cd')
+  })
+
+  it('空 body 得 400，而不是拿着空音频去打百炼', async () => {
+    const empty = await upload(Buffer.alloc(0))
+    assert.equal(empty.status, 400)
+    assert.match(empty.body.message, /没有收到音频/)
+  })
+
+  it('查一个不存在的档案得 404', async () => {
+    const response = await realFetch(`${base}/dsh-cosyvoice/clone/status?id=nope`)
+    assert.equal(response.status, 404)
+  })
+
+  it('云端音色能一键导入，模型从音色 ID 前缀反推', async () => {
+    const listed = await json(await realFetch(`${base}/dsh-cosyvoice/cloud-voices`))
+    assert.equal(listed.ok, true)
+    assert.equal(listed.voices.length, 1)
+
+    const imported = await json(await realFetch(`${base}/dsh-cosyvoice/cloud-voices/import`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+    }))
+    assert.equal(imported.ok, true)
+    assert.equal(imported.added, 1)
+    const cloud = imported.profiles.find(item => item.voiceId === 'cosyvoice-v3.5-plus-cloud1')
+    assert.equal(cloud.source, 'cloud')
+    assert.equal(cloud.model, 'cosyvoice-v3.5-plus')
+    assert.equal(cloud.status, 'ready')
+
+    // 再导一次：已经有的不重复加。
+    const again = await json(await realFetch(`${base}/dsh-cosyvoice/cloud-voices/import`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+    }))
+    assert.equal(again.added, 0)
+
+    // 收尾：把这次产生的档案删掉，别污染后面可能新增的用例。
+    for (const item of await json(await realFetch(`${base}/dsh-cosyvoice/profiles`)).then(r => r.profiles)) {
+      await realFetch(`${base}/dsh-cosyvoice/profiles`, {
+        method: 'DELETE',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ id: item.id }),
+      })
+    }
   })
 })

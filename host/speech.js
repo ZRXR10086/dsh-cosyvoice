@@ -117,17 +117,20 @@ export class SpeechClient {
   /**
    * 合成一段文本，返回音频字节。
    * @param rawText - 要朗读的文本（可以是 Markdown，会先清洗）。
+   * @param identity - 本次要用的模型与音色；省略时用设置里的回退值。
    * @returns 音频字节、使用的音色与模型、以及字符用量。
    * @throws {Error} 配置缺失或合成失败时抛出（消息可直接展示给用户）。
    */
-  async synthesize(rawText) {
+  async synthesize(rawText, identity) {
     const text = normalizeText(rawText)
     if (text === '') throw new Error('没有可朗读的文本。')
 
     const settings = this.getSettings()
     const apiKey = String(settings?.apiKey ?? '').trim()
-    const voiceId = String(settings?.voiceId ?? '').trim()
-    const model = String(settings?.model ?? '').trim() || DEFAULT_MODEL
+    // 音色与模型由编排层定（激活的音色档案优先于设置），本类只管把它们发出去 ——
+    // 让它自己去读设置的话，切了档案请求却还在用旧音色。
+    const voiceId = String(identity?.voiceId ?? settings?.voiceId ?? '').trim()
+    const model = String(identity?.model ?? settings?.model ?? '').trim() || DEFAULT_MODEL
     if (apiKey === '') throw new Error('未配置 API Key。请在 设置 → 语音 中填写阿里云百炼的 Key。')
     if (voiceId === '') throw new Error('未配置音色 ID。请在 设置 → 语音 中填写已注册的复刻音色 ID。')
 

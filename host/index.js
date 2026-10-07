@@ -26,6 +26,9 @@ import { AudioStore } from './store.js'
 import { SpeechClient } from './speech.js'
 import { VoiceSynthesizer } from './synth.js'
 import { MessageTextResolver } from './texts.js'
+import { VoiceProfiles } from './profiles.js'
+import { VoiceCloner } from './clone.js'
+import { SegmentSynth } from './segments.js'
 import { cosyvoiceRoutes } from './routes.js'
 
 /** 稳定的 cordis 插件名。 */
@@ -98,7 +101,14 @@ export function apply(ctx, config) {
   const store = new AudioStore(() => settings().outputDir)
   const speech = new SpeechClient({ getSettings: settings })
   const texts = new MessageTextResolver({ log })
-  const synth = new VoiceSynthesizer({ speech, store, getSettings: settings, log })
+  // 音色档案自管一个 JSON（理由见 ./profiles.js 头注释），所以它不在 cordis 的
+  // 配置面里，也就不会随着配置重载被重建 —— 挂载/重载插件不该动用户的音色清单。
+  const profiles = new VoiceProfiles()
+  const synth = new VoiceSynthesizer({ speech, store, getSettings: settings, profiles, log })
+  const cloner = new VoiceCloner({ getSettings: settings })
+  // 分句并行 + 首句优先。合成器是带缓存的，所以句子级缓存自动生效：
+  // 第二次播放同一条回答时几乎每一句都命中，接近零等待。
+  const segments = new SegmentSynth({ synth, log })
 
   try {
     store.ensure()
@@ -109,8 +119,11 @@ export function apply(ctx, config) {
   for (const route of cosyvoiceRoutes({
     getSettings: settings,
     synth,
+    segments,
     store,
     texts,
+    profiles,
+    cloner,
     bootClip: fileURLToPath(new URL('../assets/boot.mp3', import.meta.url)),
     log,
     openDir: revealDirectory,

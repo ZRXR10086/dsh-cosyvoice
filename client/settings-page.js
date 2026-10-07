@@ -82,6 +82,42 @@ var CHECKBOX = {
   accentColor: T.accent,
 }
 
+/** 档案列表里的一行。 */
+var PROFILE_ROW = {
+  display: 'flex',
+  alignItems: 'center',
+  gap: '8px',
+  padding: '7px 10px',
+  borderRadius: '6px',
+  border: '1px solid ' + T.borderSoft,
+  marginBottom: '6px',
+  background: 'var(--dsw-alias-bg-layer-1, transparent)',
+}
+
+/** 档案行里的小按钮：一行挤了四个动作，用不着主按钮的体型。 */
+var MINI_BUTTON = {
+  flex: 'none',
+  padding: '3px 8px',
+  borderRadius: '5px',
+  border: '1px solid ' + T.border,
+  background: 'transparent',
+  color: T.textDim,
+  font: 'inherit',
+  fontSize: '11px',
+  cursor: 'pointer',
+}
+
+/** 档案名下面那行等宽小字（音色 ID + 模型）。 */
+var PROFILE_META = {
+  fontSize: '11px',
+  lineHeight: '16px',
+  color: T.textFaint,
+  fontFamily: 'monospace',
+  overflow: 'hidden',
+  textOverflow: 'ellipsis',
+  whiteSpace: 'nowrap',
+}
+
 /**
  * 订阅一个配置镜像。
  * @param form - `configForms` 给出的表单控制器。
@@ -116,7 +152,6 @@ function CosyvoiceSettingsPage(props) {
 
   var value = (snapshot && snapshot.value) || {}
   var hasSecret = !!(snapshot && snapshot.user && typeof snapshot.user === 'object' && 'apiKey' in snapshot.user)
-  var configured = (hasSecret || String(value.apiKey || '') !== '') && String(value.voiceId || '') !== ''
 
   var statusState = React.useState(null)
   var status = statusState[0]
@@ -125,6 +160,171 @@ function CosyvoiceSettingsPage(props) {
   var countState = React.useState(null)
   var count = countState[0]
   var setCount = countState[1]
+
+  // 档案清单**不**走 configForms：它是插件自管的一个 JSON（见 host/profiles.js），
+  // 配置镜像里没有它。于是这里自己拉、自己存，写操作回包里带一份新清单，
+  // 省掉一次往返也让列表和"当前音色"永远同一拍。
+  var profilesState = React.useState(null)
+  var profileData = profilesState[0]
+  var setProfileData = profilesState[1]
+
+  /** 正在编辑的草稿；`editId` 为空表示"新增"而不是"改这一套"。 */
+  var draftState = React.useState({ name: '', voiceId: '', model: '' })
+  var draft = draftState[0]
+  var setDraft = draftState[1]
+
+  var editIdState = React.useState('')
+  var editId = editIdState[0]
+  var setEditId = editIdState[1]
+
+  /** 待上传的音频文件。 */
+  var fileState = React.useState(null)
+  var file = fileState[0]
+  var setFile = fileState[1]
+
+  /** 克隆/同步这块的进度提示；与页面底部的 status 分开，因为它信息量更大。 */
+  var cloneState = React.useState(null)
+  var cloneNote = cloneState[0]
+  var setCloneNote = cloneState[1]
+
+  /** 轮询一个正在部署的音色。 */
+  function pollClone(id) {
+    var tries = 0
+    setCloneNote({ kind: 'busy', message: t('clone.pending') })
+    // 客户端轮询而不是服务端挂长请求：关掉页面就不会留下 orphan 轮询。
+    function tick() {
+      tries += 1
+      rpc('clone/status?id=' + encodeURIComponent(id)).then(function (res) {
+        if (res === undefined || !res.ok) {
+          setCloneNote({ kind: 'error', message: (res && res.message) || t('clone.failed') })
+          return
+        }
+        setProfileData({ profiles: res.profiles || [], activeId: res.activeId || '' })
+        if (res.phase === 'ready') {
+          setCloneNote({ kind: 'ok', message: t('clone.ready') })
+          return
+        }
+        if (res.phase === 'failed') {
+          setCloneNote({ kind: 'error', message: t('clone.failed') })
+          return
+        }
+        // 部署通常几秒到几分钟，两分钟足够；超时不判失败，列表里的状态仍在。
+        if (tries >= 40) {
+          setCloneNote({ kind: 'error', message: t('clone.timeout') })
+          return
+        }
+        setTimeout(tick, 3000)
+      })
+    }
+    setTimeout(tick, 1500)
+  }
+
+  /** 上传音频并复刻。 */
+  function startClone() {
+    if (file === null || file === undefined) {
+      setCloneNote({ kind: 'error', message: t('clone.noFile') })
+      return
+    }
+    setCloneNote({ kind: 'busy', message: t('clone.uploading') })
+    var raw = file.name || 'voice.wav'
+    file.arrayBuffer().then(function (buffer) {
+      return rpcBytes('clone',
+        'name=' + encodeURIComponent(raw.replace(/\.[^.]+$/, '')) + '&filename=' + encodeURIComponent(raw),
+        buffer)
+    }).then(function (res) {
+      if (res === undefined || !res.ok) {
+        setCloneNote({ kind: 'error', message: (res && res.message) || t('clone.failed') })
+        return
+      }
+      setProfileData({ profiles: res.profiles || [], activeId: res.activeId || '' })
+      pollClone(res.profile.id)
+    })
+  }
+
+  /** 把云端已有的音色拉进档案。 */
+  function syncCloud() {
+    setCloneNote({ kind: 'busy', message: t('clone.syncing') })
+    rpc('cloud-voices/import', {}).then(function (res) {
+      if (res === undefined || !res.ok) {
+        setCloneNote({ kind: 'error', message: (res && res.message) || t('error.generic') })
+        return
+      }
+      setProfileData({ profiles: res.profiles || [], activeId: res.activeId || '' })
+      setCloneNote({
+        kind: 'ok',
+        message: res.added > 0 ? t('clone.synced') + '：' + String(res.added) : t('clone.syncedNone'),
+      })
+    })
+  }
+
+  // "能用"的判定要算上档案：一套档案启用着但没有默认音色 ID 时，照样可以朗读。
+  // 这一行放在 profileData 之后，是因为它还是 undefined 时 `!= null` 会误判成 true。
+  var hasVoice = String(value.voiceId || '') !== '' || (profileData !== null && profileData.activeId !== '')
+  var configured = (hasSecret || String(value.apiKey || '') !== '') && hasVoice
+
+  /** 清空草稿。 */
+  function resetDraft() {
+    setDraft({ name: '', voiceId: '', model: '' })
+    setEditId('')
+  }
+
+  /** 拉取档案清单。 */
+  function refreshProfiles() {
+    rpc('profiles').then(function (res) {
+      if (res === undefined || !res.ok) return
+      setProfileData({ profiles: res.profiles || [], activeId: res.activeId || '' })
+    })
+  }
+
+  React.useEffect(function () { refreshProfiles() }, [])
+
+  /** 启用一套档案。 */
+  function useProfile(id) {
+    rpc('profiles/activate', { id: id }).then(function (res) {
+      if (res === undefined || !res.ok) {
+        setStatus({ kind: 'error', message: (res && res.message) || t('error.generic') })
+        return
+      }
+      setProfileData({ profiles: res.profiles || [], activeId: res.activeId || '' })
+      setStatus({ kind: 'ok', message: t('settings.saved') })
+    })
+  }
+
+  /** 删除一套档案。 */
+  function removeProfile(id) {
+    rpc('profiles', { id: id }, 'DELETE').then(function (res) {
+      if (res === undefined || !res.ok) {
+        setStatus({ kind: 'error', message: (res && res.message) || t('error.generic') })
+        return
+      }
+      setProfileData({ profiles: res.profiles || [], activeId: res.activeId || '' })
+      if (editId === id) resetDraft()
+      setStatus({ kind: 'ok', message: t('settings.saved') })
+    })
+  }
+
+  /** 保存草稿：有 editId 是更新，没有是新增。 */
+  function saveProfile() {
+    var voiceId = String(draft.voiceId || '').trim()
+    if (voiceId === '') {
+      setStatus({ kind: 'error', message: t('profiles.needVoice') })
+      return
+    }
+    rpc('profiles', {
+      id: editId,
+      name: String(draft.name || '').trim(),
+      voiceId: voiceId,
+      model: String(draft.model || '').trim(),
+    }).then(function (res) {
+      if (res === undefined || !res.ok) {
+        setStatus({ kind: 'error', message: (res && res.message) || t('error.generic') })
+        return
+      }
+      setProfileData({ profiles: res.profiles || [], activeId: res.activeId || '' })
+      resetDraft()
+      setStatus({ kind: 'ok', message: t('settings.saved') })
+    })
+  }
 
   React.useEffect(function () {
     rpc('status').then(function (res) {
@@ -145,13 +345,13 @@ function CosyvoiceSettingsPage(props) {
         setStatus({ kind: 'error', message: (res && res.message) || t('error.generic') })
         return
       }
-      if (res.clip === null || res.clip === undefined) {
+      if (!Array.isArray(res.segments) || res.segments.length === 0 || !res.segments[0].url) {
         player.stop()
         setStatus({ kind: 'error', message: t('error.generic') })
         return
       }
       setStatus({ kind: 'ok', message: t('settings.saved') })
-      player.play('__preview__', res.clip.url)
+      player.startQueue('__preview__', res)
     })
   }
 
@@ -183,6 +383,123 @@ function CosyvoiceSettingsPage(props) {
       hint === undefined ? null : React.createElement('div', { style: HINT }, hint))
   }
 
+  /**
+   * 草稿里的一个输入框。
+   * @param key - `name` / `voiceId` / `model`。
+   * @param placeholderKey - 占位文案的字典键。
+   * @returns 受控输入框。
+   */
+  function draftField(key, placeholderKey) {
+    return React.createElement('input', {
+      key: key,
+      type: 'text',
+      value: draft[key] === undefined ? '' : draft[key],
+      placeholder: t(placeholderKey),
+      style: INPUT,
+      onChange: function (event) {
+        var next = { name: draft.name, voiceId: draft.voiceId, model: draft.model }
+        next[key] = event.target.value
+        setDraft(next)
+      },
+    })
+  }
+
+  /**
+   * 一条档案。点"编辑"把它装进草稿，于是新增和编辑共用同一组输入框。
+   * @param profile - 档案。
+   * @returns 一行。
+   */
+  function profileRow(profile) {
+    var isActive = profileData !== null && profile.id === profileData.activeId
+    return React.createElement('div', { key: profile.id, style: PROFILE_ROW },
+      React.createElement('span', {
+        style: {
+          flex: 'none',
+          width: '8px',
+          height: '8px',
+          borderRadius: '50%',
+          background: isActive ? T.accent : 'transparent',
+          border: '1px solid ' + T.border,
+        },
+      }),
+      React.createElement('div', { style: { flex: '1', minWidth: '0' } },
+        React.createElement('div', { style: { fontSize: '13px', lineHeight: '18px', color: T.text } },
+          profile.name === '' ? profile.voiceId : profile.name),
+        React.createElement('div', { style: PROFILE_META },
+          profile.voiceId + (profile.model === '' ? '' : ' · ' + profile.model))),
+      // 克隆来的音色在部署好之前不能用，所以状态要摆在行上，别让人点了才发现问题。
+      profile.status === 'ready' || profile.status === undefined
+        ? null
+        : React.createElement('span', {
+          style: {
+            flex: 'none',
+            fontSize: '11px',
+            color: profile.status === 'failed' ? '#d93025' : T.textFaint,
+          },
+        }, profile.status === 'failed' ? t('profiles.failed') : t('profiles.pending')),
+      isActive
+        ? React.createElement('span', { style: { flex: 'none', fontSize: '11px', color: T.accent } }, t('profiles.current'))
+        : React.createElement('button', {
+          type: 'button',
+          style: MINI_BUTTON,
+          onClick: function () { useProfile(profile.id) },
+        }, t('profiles.use')),
+      React.createElement('button', {
+        type: 'button',
+        style: MINI_BUTTON,
+        onClick: function () {
+          setEditId(profile.id)
+          setDraft({ name: profile.name || '', voiceId: profile.voiceId || '', model: profile.model || '' })
+        },
+      }, t('profiles.edit')),
+      React.createElement('button', {
+        type: 'button',
+        style: MINI_BUTTON,
+        onClick: function () { removeProfile(profile.id) },
+      }, t('profiles.delete')))
+  }
+
+  var profilesBlock = React.createElement('div', { style: { padding: '10px 0 4px' } },
+    React.createElement('div', { style: { fontSize: '13px', lineHeight: '20px', color: T.text } }, t('profiles.title')),
+    React.createElement('div', { style: HINT }, t('profiles.hint')),
+    profileData === null || profileData.profiles.length === 0
+      ? React.createElement('div', { style: HINT }, t('profiles.empty'))
+      : React.createElement('div', null, profileData.profiles.map(profileRow)),
+    React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: '8px' } },
+      draftField('name', 'profiles.namePlaceholder'),
+      draftField('voiceId', 'profiles.voicePlaceholder'),
+      draftField('model', 'profiles.modelPlaceholder'),
+      React.createElement('button', {
+        type: 'button',
+        style: BUTTON,
+        onClick: saveProfile,
+      }, editId === '' ? t('profiles.add') : t('profiles.save')),
+      editId === ''
+        ? null
+        : React.createElement('button', { type: 'button', style: BUTTON, onClick: resetDraft }, t('profiles.cancel'))),
+    React.createElement('div', { style: { fontSize: '13px', lineHeight: '20px', color: T.text, padding: '6px 0 0' } }, t('clone.title')),
+    React.createElement('div', { style: HINT }, t('clone.hint')),
+    React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' } },
+      React.createElement('input', {
+        type: 'file',
+        accept: 'audio/*',
+        style: { flex: 'none', fontSize: '12px', color: T.textDim, maxWidth: '220px' },
+        onChange: function (event) {
+          var picked = event.target.files === null || event.target.files === undefined ? null : event.target.files[0]
+          setFile(picked === undefined ? null : picked)
+        },
+      }),
+      React.createElement('button', { type: 'button', style: BUTTON, onClick: startClone }, t('clone.start')),
+      React.createElement('button', { type: 'button', style: BUTTON, onClick: syncCloud }, t('clone.sync')),
+      cloneNote === null
+        ? null
+        : React.createElement('span', {
+          style: {
+            fontSize: '12px',
+            color: cloneNote.kind === 'error' ? '#d93025' : cloneNote.kind === 'ok' ? T.accent : T.textFaint,
+          },
+        }, cloneNote.message)))
+
   return React.createElement('div', { style: { display: 'block' } },
     React.createElement('div', { style: { fontSize: '16px', lineHeight: '24px', color: T.text, padding: '4px 0 2px' } }, t('settings.title')),
     React.createElement('div', { style: HINT }, t('settings.hint')),
@@ -204,9 +521,10 @@ function CosyvoiceSettingsPage(props) {
         },
       }),
     ]),
+    profilesBlock,
     // 其余字段同样是"失焦即写入"：每敲一个字符都发一次写请求会把 revision 用光，
     // 而且中间态（半个 Key）本身也不是一个合法配置。
-    row('settings.voice', undefined, [
+    row('settings.voice', t('settings.voiceHint'), [
       React.createElement('input', {
         key: 'voice',
         type: 'text',

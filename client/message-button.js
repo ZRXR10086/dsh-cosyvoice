@@ -48,16 +48,20 @@ function IconStop() {
  * @returns SVG 元素。
  */
 function IconBusy() {
+  // animateTransform 必须待在 <g> 里：SVG 的动画元素作用于其**父元素**。
+  // 若直接挂在 <svg> 下，旋转的是整个图标（连带它在按钮里的位置一起绕圈），
+  // 看起来就是"整体也在转"。放进 <g> 后只有这条弧绕中心转。
   return React.createElement('svg', ICON,
-    React.createElement('path', { d: 'M12 3a9 9 0 1 0 9 9', opacity: '0.85' }),
-    React.createElement('animateTransform', {
-      attributeName: 'transform',
-      type: 'rotate',
-      from: '0 12 12',
-      to: '360 12 12',
-      dur: '0.9s',
-      repeatCount: 'indefinite',
-    }))
+    React.createElement('g', null,
+      React.createElement('path', { d: 'M12 3a9 9 0 1 0 9 9', opacity: '0.85' }),
+      React.createElement('animateTransform', {
+        attributeName: 'transform',
+        type: 'rotate',
+        from: '0 12 12',
+        to: '360 12 12',
+        dur: '0.9s',
+        repeatCount: 'indefinite',
+      })))
 }
 
 /**
@@ -110,11 +114,12 @@ function CosyvoiceSpeakButton(props) {
         player.fail(messageId, (res && res.message) || t('error.generic'))
         return
       }
-      if (res.clip === null || res.clip === undefined || !res.clip.url) {
+      if (!Array.isArray(res.segments) || res.segments.length === 0 || !res.segments[0].url) {
         player.fail(messageId, t('error.generic'))
         return
       }
-      player.play(messageId, res.clip.url)
+      // 首句一就绪就开始播；剩下的句子在后台继续合成，播放器自己会按序接上。
+      player.startQueue(messageId, res)
     })
   }
 

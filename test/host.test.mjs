@@ -24,6 +24,7 @@ import {
 import { AudioStore, cacheKeyOf } from '../host/store.js'
 import { VoiceSynthesizer } from '../host/synth.js'
 import { MessageTextResolver } from '../host/texts.js'
+import { VoiceProfiles } from '../host/profiles.js'
 
 /** 一段"像百炼回的那种"合成响应：内层给 base64 音频。 */
 function okResponse(audioBase64, characters = 12) {
@@ -267,6 +268,137 @@ describe('VoiceSynthesizer', () => {
     await assert.rejects(synth.synthesize('会失败'), /未配置 API Key/)
     assert.equal(store.count(), 0)
     settings.apiKey = 'sk-test'
+  })
+})
+
+describe('VoiceProfiles', () => {
+  let dir
+  let profiles
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'cosyvoice-profiles-'))
+    profiles = new VoiceProfiles(() => join(dir, 'profiles.json'))
+  })
+
+  it('文件不存在时给出空档案，而不是抛错', () => {
+    assert.deepEqual(profiles.list(), [])
+    assert.equal(profiles.active(), undefined)
+  })
+
+  it('第一套档案自动成为当前音色', () => {
+    const saved = profiles.put({ name: '我的声音', voiceId: 'voice-a', model: 'cosyvoice-v3.5-plus' })
+    assert.equal(profiles.active().id, saved.id)
+    assert.equal(profiles.active().voiceId, 'voice-a')
+    assert.equal(profiles.active().source, 'manual')
+  })
+
+  it('后面的档案不会抢走当前音色，要显式切换', () => {
+    const first = profiles.put({ name: '一', voiceId: 'voice-a', model: 'm' })
+    profiles.put({ name: '二', voiceId: 'voice-b', model: 'm' })
+    assert.equal(profiles.active().id, first.id)
+    assert.equal(profiles.activate(profiles.list()[1].id), true)
+    assert.equal(profiles.active().voiceId, 'voice-b')
+  })
+
+  it('更新只覆盖这次给了的字段', () => {
+    const saved = profiles.put({ name: '克隆中', voiceId: '', model: 'm', source: 'clone', status: 'pending' })
+    profiles.put({ id: saved.id, voiceId: 'voice-cloned', status: 'ready' })
+    const updated = profiles.list()[0]
+    assert.equal(updated.voiceId, 'voice-cloned')
+    // 来源没在这次请求里出现，就该保持 clone —— 否则克隆音色会被打回 manual。
+    assert.equal(updated.source, 'clone')
+    assert.equal(updated.status, 'ready')
+    assert.equal(updated.name, '克隆中')
+  })
+
+  it('删掉当前音色后退回剩下第一条，删空则没有当前音色', () => {
+    const first = profiles.put({ name: '一', voiceId: 'voice-a', model: 'm' })
+    const second = profiles.put({ name: '二', voiceId: 'voice-b', model: 'm' })
+    profiles.activate(second.id)
+    assert.equal(profiles.remove(second.id), true)
+    assert.equal(profiles.active().id, first.id)
+    profiles.remove(first.id)
+    assert.equal(profiles.active(), undefined)
+    assert.equal(profiles.remove('不存在的 id'), false)
+  })
+
+  it('坏掉的 JSON 退化成空档案而不是让插件挂掉', () => {
+    writeFileSync(profiles.path(), '{ 这不是 JSON')
+    assert.deepEqual(profiles.list(), [])
+    // 还能继续写：用户重新加一套就恢复了。
+    profiles.put({ name: '重来', voiceId: 'voice-c', model: 'm' })
+    assert.equal(profiles.list().length, 1)
+  })
+
+  it('非法字段被收敛成合法值', () => {
+    profiles.save({ version: 1, activeId: '', profiles: [{ id: 'x', voiceId: 'v', source: '火星来的', status: '??' }] })
+    const entry = profiles.list()[0]
+    assert.equal(entry.source, 'manual')
+    assert.equal(entry.status, 'ready')
+    assert.equal(entry.name, '')
+  })
+})
+
+describe('VoiceSynthesizer 与音色档案', () => {
+  let dir
+  let store
+  let profiles
+
+  const settings = { apiKey: 'sk-test', voiceId: 'voice-fallback', model: 'model-fallback' }
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'cosyvoice-synth-profile-'))
+    profiles = new VoiceProfiles(() => join(dir, 'profiles.json'))
+    store = new AudioStore(() => dir)
+  })
+
+  /** 一个只记请求体的合成客户端。 */
+  function synthWith(calls) {
+    const fetchImpl = async (url, init) => {
+      calls.push(JSON.parse(init.body))
+      return okResponse(Buffer.from('MP3BYTES').toString('base64'), 7)
+    }
+    return new VoiceSynthesizer({
+      speech: new SpeechClient({ getSettings: () => settings, fetchImpl }),
+      store,
+      getSettings: () => settings,
+      profiles,
+    })
+  }
+
+  it('没有档案时用设置里的回退值', async () => {
+    const calls = []
+    await synthWith(calls).synthesize('你好')
+    assert.equal(calls[0].input.voice, 'voice-fallback')
+    assert.equal(calls[0].model, 'model-fallback')
+  })
+
+  it('启用档案后按档案的音色与模型合成', async () => {
+    profiles.put({ name: '档案音色', voiceId: 'voice-profile', model: 'model-profile' })
+    const calls = []
+    await synthWith(calls).synthesize('你好')
+    assert.equal(calls[0].input.voice, 'voice-profile')
+    assert.equal(calls[0].model, 'model-profile')
+  })
+
+  it('克隆中（还没有音色 ID）的档案不算数，回落到设置', async () => {
+    profiles.put({ name: '克隆中', voiceId: '', model: 'model-profile', source: 'clone', status: 'pending' })
+    const calls = []
+    await synthWith(calls).synthesize('你好')
+    assert.equal(calls[0].input.voice, 'voice-fallback')
+  })
+
+  it('换档案后缓存不串味', async () => {
+    const first = profiles.put({ name: '一', voiceId: 'voice-a', model: 'm' })
+    const second = profiles.put({ name: '二', voiceId: 'voice-b', model: 'm' })
+    const calls = []
+    const synth = synthWith(calls)
+    await synth.synthesize('同一条')
+    profiles.activate(second.id)
+    const again = await synth.synthesize('同一条')
+    assert.equal(again.cached, false)
+    assert.equal(calls.length, 2)
+    assert.equal(first.id !== second.id, true)
   })
 })
 
