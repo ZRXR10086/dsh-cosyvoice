@@ -121,6 +121,19 @@ var MODE_BUTTON = {
 }
 
 /** 模式切换里选中的那一半：用品牌色描边 + 底色，一眼看得出当前是哪种。 */
+/** 下拉框：音色绑定用它，因为可选的值是"已保存的档案"这个有限集。 */
+var SELECT = {
+  flex: '1',
+  minWidth: '0',
+  height: '28px',
+  padding: '0 6px',
+  borderRadius: '6px',
+  border: '1px solid var(--dsw-alias-border-l2, rgba(128, 128, 128, 0.24))',
+  background: 'transparent',
+  color: 'var(--dsw-alias-label-primary, inherit)',
+  fontSize: '13px',
+}
+
 var MODE_BUTTON_ACTIVE = {
   flex: 'none',
   padding: '5px 14px',
@@ -187,6 +200,27 @@ function CosyvoiceSettingsPage(props) {
   var mode = modeState[0] === ''
     ? (String(value.mode || '') === 'stream' ? 'stream' : 'one-shot')
     : modeState[0]
+
+  // 角色扮演：与合成方式同一套处理方式 —— 本机那一份优先，配置镜像是"没选过时"
+  // 的默认值。绑定音色同理，唯一区别是它还要区分"没选过（null）"与"选了跟随
+  // （空串）"，否则选了跟随之后下一次打开又会跳回配置里那个值。
+  var roleState = React.useState(readRoleplay())
+  var setRoleLocal = roleState[1]
+  var roleplayOn = roleState[0] === ''
+    ? value.roleplay === true
+    : roleState[0] === 'true'
+
+  var narrationState = React.useState(readNarrationVoice())
+  var setNarrationLocal = narrationState[1]
+  var narrationVoice = narrationState[0] === null || narrationState[0] === undefined
+    ? String(value.narrationVoiceId || '')
+    : narrationState[0]
+
+  var characterState = React.useState(readCharacterVoice())
+  var setCharacterLocal = characterState[1]
+  var characterVoice = characterState[0] === null || characterState[0] === undefined
+    ? String(value.characterVoiceId || '')
+    : characterState[0]
 
   var statusState = React.useState(null)
   var status = statusState[0]
@@ -364,7 +398,9 @@ function CosyvoiceSettingsPage(props) {
   // 把自己的选择带上去问，于是拿回来的是"按这个选择真正会走哪条路"，而不是
   // 配置文档里那一行 —— 两者不一致时（配置没写进去）页面会明确说出来。
   React.useEffect(function () {
-    rpc('status?mode=' + encodeURIComponent(mode)).then(function (res) {
+    var query = 'mode=' + encodeURIComponent(mode)
+      + '&roleplay=' + encodeURIComponent(roleplayOn ? 'true' : 'false')
+    rpc('status?' + query).then(function (res) {
       if (res === undefined || !res.ok) return
       setCount({
         count: res.count,
@@ -372,9 +408,11 @@ function CosyvoiceSettingsPage(props) {
         configured: res.configured,
         mode: res.mode,
         configuredMode: res.configuredMode,
+        roleplay: res.roleplay === true,
+        configuredRoleplay: res.configuredRoleplay === true,
       })
     })
-  }, [snapshot, mode])
+  }, [snapshot, mode, roleplayOn])
 
   /**
    * 试听：走一次真实合成，所以能一次性验出 Key、模型与音色是否匹配。
@@ -383,7 +421,10 @@ function CosyvoiceSettingsPage(props) {
     setStatus(null)
     // 试听走的正是播放键那条路：`speakAs` 按服务端模式自己选整段还是流式，所以
     // 试听也是在验用户真正会用到的那一条链路。
-    speakAs('speak', { text: t('settings.previewText') }, '__preview__').then(function () {
+    // 角色扮演开着的时候，试听文本得带一句台词，否则听不出"旁白/角色两种声音"。
+    speakAs('speak', {
+      text: roleplayOn ? t('settings.previewRoleplayText') : t('settings.previewText'),
+    }, '__preview__').then(function () {
       var snapshot = player.getSnapshot()
       if (snapshot.idle === true || snapshot.kind !== 'error') {
         setStatus({ kind: 'ok', message: t('settings.saved') })
@@ -467,6 +508,108 @@ function CosyvoiceSettingsPage(props) {
       style: active ? MODE_BUTTON_ACTIVE : MODE_BUTTON,
       onClick: function () { switchMode(target) },
     }, t(labelKey))
+  }
+
+  /**
+   * 写回宿主配置，并且**把失败说出来**。
+   *
+   * `write()` 会静默吞掉 rejection（见 {@link useConfigForm}），那对"改个 Key"是
+   * 合适的，但对开关不合适：用户拨了一下却毫无反馈，就无法区分"生效了"和"没生效"。
+   * @param field - 配置字段名。
+   * @param value - 要写入的值。
+   * @param okKey - 成功文案键。
+   * @param failKey - 失败文案键。
+   */
+  function writeVisible(field, value, okKey, failKey) {
+    setStatus(null)
+    var done
+    try {
+      done = form.set(field, value)
+    } catch (error) {
+      setStatus({ kind: 'error', message: t(failKey) })
+      console.error('[dsh-cosyvoice] 写入 ' + field + ' 失败：', error)
+      return
+    }
+    if (done !== undefined && done !== null && typeof done.then === 'function') {
+      done.then(function () {
+        setStatus({ kind: 'ok', message: t(okKey) })
+      }).catch(function (error) {
+        setStatus({ kind: 'error', message: t(failKey) })
+        console.error('[dsh-cosyvoice] 写入 ' + field + ' 失败：', error)
+      })
+    }
+  }
+
+  /** 拨动角色扮演开关。 */
+  function switchRoleplay(on) {
+    setRoleLocal(on ? 'true' : 'false')
+    saveRoleplay(on)
+    writeVisible('roleplay', on, 'settings.roleplaySaved', 'settings.roleplayFailed')
+  }
+
+  /**
+   * 绑定一个音色。
+   * @param which - `narration` 是旁白，`character` 是角色。
+   * @param id - 音色 ID；空串表示"跟随当前音色"。
+   */
+  function pickVoice(which, id) {
+    if (which === 'narration') {
+      setNarrationLocal(id)
+      saveNarrationVoice(id)
+      writeVisible('narrationVoiceId', id, 'settings.roleplayVoiceSaved', 'settings.roleplayVoiceFailed')
+      return
+    }
+    setCharacterLocal(id)
+    saveCharacterVoice(id)
+    writeVisible('characterVoiceId', id, 'settings.roleplayVoiceSaved', 'settings.roleplayVoiceFailed')
+  }
+
+  /**
+   * 角色扮演开关里的一个按钮。
+   * @param on - 它代表的那个值。
+   * @param labelKey - 文案键。
+   * @returns 一个按钮。
+   */
+  function roleplayButton(on, labelKey) {
+    var active = roleplayOn === on
+    return React.createElement('button', {
+      key: on ? 'on' : 'off',
+      type: 'button',
+      'aria-pressed': active,
+      style: active ? MODE_BUTTON_ACTIVE : MODE_BUTTON,
+      onClick: function () { switchRoleplay(on) },
+    }, t(labelKey))
+  }
+
+  /**
+   * 一个音色绑定下拉。
+   *
+   * 选项只有两类：跟随当前音色（空），以及已保存的档案。不做自由输入是因为这里
+   * 要的是"从已经配好的音色里挑一个"，手填 ID 是上面「默认音色 ID」那一栏的事。
+   * @param labelKey - 标签文案键。
+   * @param current - 当前值。
+   * @param onPick - 选中回调。
+   * @returns 一行。
+   */
+  function voiceSelect(labelKey, current, onPick) {
+    var options = [React.createElement('option', { key: '', value: '' }, t('settings.voiceFollow'))]
+    var list = profileData === null || profileData === undefined ? [] : profileData.profiles
+    for (var i = 0; i < list.length; i++) {
+      var profile = list[i]
+      if (profile.voiceId === '') continue
+      options.push(React.createElement('option', {
+        key: profile.id,
+        value: profile.voiceId,
+      }, profile.name === '' || profile.name === undefined ? profile.voiceId : profile.name))
+    }
+    return row(labelKey, undefined, [
+      React.createElement('select', {
+        key: labelKey,
+        value: current,
+        style: SELECT,
+        onChange: function (event) { onPick(event.target.value) },
+      }, options),
+    ])
   }
 
   /**
@@ -622,6 +765,24 @@ function CosyvoiceSettingsPage(props) {
           : t('settings.modeOnce'))
         + (count.configuredMode === count.mode ? '' : ' · ' + t('settings.modeUnsaved'))),
     profilesBlock,
+    // 角色扮演排在音色档案之后：它绑的就是档案里的音色，先有档案才有得挑。
+    React.createElement('div', { style: { padding: '10px 0 4px' } },
+      React.createElement('div', { style: { fontSize: '13px', lineHeight: '20px', color: T.text } }, t('settings.roleplay')),
+      React.createElement('div', { style: HINT }, t('settings.roleplayHint')),
+      React.createElement('div', { style: { display: 'flex', gap: '8px', padding: '6px 0 0' } },
+        roleplayButton(true, 'settings.roleplayOn'),
+        roleplayButton(false, 'settings.roleplayOff')),
+      // 服务端回报的"真正会生效的那个"，与本地选择不一致时把话说出来。
+      count === null || count.roleplay === undefined
+        ? null
+        : React.createElement('div', { style: HINT },
+          t('settings.modeEffective') + '：' + (count.roleplay
+            ? t('settings.roleplayOn')
+            : t('settings.roleplayOff'))
+          + (count.configuredRoleplay === count.roleplay ? '' : ' · ' + t('settings.modeUnsaved'))),
+      voiceSelect('settings.narrationVoice', narrationVoice, function (id) { pickVoice('narration', id) }),
+      voiceSelect('settings.characterVoice', characterVoice, function (id) { pickVoice('character', id) }),
+      React.createElement('div', { style: HINT }, t('settings.roleplayVoiceHint'))),
     // 其余字段同样是"失焦即写入"：每敲一个字符都发一次写请求会把 revision 用光，
     // 而且中间态（半个 Key）本身也不是一个合法配置。
     row('settings.voice', t('settings.voiceHint'), [

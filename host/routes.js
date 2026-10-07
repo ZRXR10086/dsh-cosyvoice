@@ -16,7 +16,7 @@
 
 import { createReadStream, existsSync } from 'node:fs'
 import { MAX_UPLOAD_BYTES, modelFromVoiceId } from './clone.js'
-import { MODE_ONE_SHOT, MODE_STREAM, normalizeMode } from './settings.js'
+import { MODE_ONE_SHOT, MODE_STREAM, normalizeFlag, normalizeMode } from './settings.js'
 import { STREAM_SAMPLE_RATE } from './stream.js'
 import { mimeOf } from './store.js'
 
@@ -202,6 +202,38 @@ export function cosyvoiceRoutes({ getSettings, synth, store, texts, profiles, cl
   }
 
   /**
+   * 本次请求是否按角色扮演处理。
+   *
+   * 与 {@link modeOf} 同一个道理：请求里给的是"用户刚刚拨的开关"，配置里是持久化
+   * 的那一份。宿主配置通道未必写得进去（schema 没跟着重载时就会失败），而开关
+   * 拨了却没反应是最难受的——所以请求给了就听请求的。
+   * @param explicit - 请求里的 `roleplay`（布尔或 'true'/'false'）。
+   * @returns 是否开启。
+   */
+  const roleplayOf = (explicit) => {
+    if (explicit === true) return true
+    if (explicit === false) return false
+    const wanted = String(explicit ?? '').trim().toLowerCase()
+    if (wanted === 'true') return true
+    if (wanted === 'false') return false
+    return normalizeFlag((getSettings() ?? {}).roleplay)
+  }
+
+  /**
+   * 一次请求的语音偏好：开不开角色扮演、旁白与台词各自用哪个音色。
+   *
+   * 两个音色 ID 允许为空，空表示"听配置的"——客户端没在本地存过就不必把配置
+   * 原样回传一遍。
+   * @param body - 请求体。
+   * @returns 交给 {@link import('./synth.js').VoiceSynthesizer} 的偏好。
+   */
+  const prefsOf = (body) => ({
+    roleplay: roleplayOf(body === undefined || body === null ? undefined : body.roleplay),
+    narrationVoiceId: String(body?.narrationVoiceId ?? '').trim(),
+    characterVoiceId: String(body?.characterVoiceId ?? '').trim(),
+  })
+
+  /**
    * 给一段音频补上浏览器该去取的 URL。
    * @param clip - 音频描述。
    * @returns 带 url 的描述；clip 为空时返回 null。
@@ -221,11 +253,12 @@ export function cosyvoiceRoutes({ getSettings, synth, store, texts, profiles, cl
    * 比假装再流一次更快也更省。
    * @param res - 响应。
    * @param text - 要朗读的文本。
+   * @param prefs - 语音偏好（角色扮演开关与两个音色）。
    * @throws {Error} 合成失败时抛出，由 {@link respond} 翻译成响应。
    */
-  const streamInto = async (res, text) => {
+  const streamInto = async (res, text, prefs) => {
     let opened = false
-    for await (const frame of synth.stream(text)) {
+    for await (const frame of synth.stream(text, prefs)) {
       if (frame.kind === 'ready' && !opened) {
         return sendJson(res, 200, { ok: true, mode: MODE_STREAM, clip: describe(frame.clip) })
       }
@@ -255,12 +288,13 @@ export function cosyvoiceRoutes({ getSettings, synth, store, texts, profiles, cl
    * @param res - 响应。
    * @param text - 要朗读的文本。
    * @param wanted - 请求里指定的合成方式；省略则按配置。
+   * @param prefs - 语音偏好；省略则按配置。
    */
-  const respond = async (res, text, wanted) => {
+  const respond = async (res, text, wanted, prefs) => {
     const mode = modeOf(wanted)
     try {
-      if (mode === MODE_STREAM) return await streamInto(res, text)
-      const clip = await synth.synthesize(text)
+      if (mode === MODE_STREAM) return await streamInto(res, text, prefs)
+      const clip = await synth.synthesize(text, prefs)
       return sendJson(res, 200, { ok: true, mode: MODE_ONE_SHOT, clip: describe(clip) })
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
@@ -300,7 +334,9 @@ export function cosyvoiceRoutes({ getSettings, synth, store, texts, profiles, cl
         const settings = getSettings() ?? {}
         // 允许问"按某个模式来算，会是怎么回事"：设置页把自己的选择带上来，于是
         // 它显示的是**真正会生效的那个值**，而不是配置文档里那一行。
-        const wanted = new URL(req.url ?? '/', 'http://localhost').searchParams.get('mode')
+        const search = new URL(req.url ?? '/', 'http://localhost').searchParams
+        const wanted = search.get('mode')
+        const wantedRoleplay = search.get('roleplay')
         // 报的是"真正会生效的那一套"（档案优先于回退值），否则用户切了音色，
         // 状态页却还在说旧的那套，试听与播放用的又不是同一个。
         const identity = synth.identity()
@@ -313,6 +349,12 @@ export function cosyvoiceRoutes({ getSettings, synth, store, texts, profiles, cl
           profileId: identity.profileId ?? '',
           mode: modeOf(wanted),
           configuredMode: modeOf(),
+          // 角色扮演的两个音色是"绑定"在设置页的，报出来是为了让页面显示
+          // 真正会生效的那一套 —— 而不是让人以为绑了却没生效。
+          roleplay: roleplayOf(wantedRoleplay),
+          configuredRoleplay: roleplayOf(),
+          narrationVoiceId: String(settings.narrationVoiceId ?? '').trim(),
+          characterVoiceId: String(settings.characterVoiceId ?? '').trim(),
           bootSound: settings.bootSound === true,
           dir: store.dir(),
           count: store.count(),
@@ -516,7 +558,7 @@ export function cosyvoiceRoutes({ getSettings, synth, store, texts, profiles, cl
         }
         // 客户端给的文本顺手登记，下次点击连 DOM 都不用读。
         if (supplied !== '' && messageId !== '') texts.remember(messageId, supplied)
-        return respond(res, text, body.mode)
+        return respond(res, text, body.mode, prefsOf(body))
       },
     },
     {
@@ -528,7 +570,7 @@ export function cosyvoiceRoutes({ getSettings, synth, store, texts, profiles, cl
         const body = await readJson(req)
         if (body === undefined) return sendJson(res, 400, { ok: false, message: '请求体不是合法 JSON' })
         const text = typeof body.text === 'string' ? body.text : ''
-        return respond(res, text, body.mode)
+        return respond(res, text, body.mode, prefsOf(body))
       },
     },
     {

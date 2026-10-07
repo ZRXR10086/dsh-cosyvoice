@@ -41,6 +41,28 @@ export function normalizeMode(raw) {
 /** 承载百炼 API Key 的字段。密钥：在所有通道上脱敏。 */
 export const API_KEY_FIELD = 'apiKey'
 
+/** 角色扮演模式：把回答拆成旁白与台词，分别用不同音色合成。 */
+export const ROLEPLAY_FIELD = 'roleplay'
+
+/** 旁白音色的配置字段。 */
+export const NARRATION_VOICE_FIELD = 'narrationVoiceId'
+
+/** 角色（台词）音色的配置字段。 */
+export const CHARACTER_VOICE_FIELD = 'characterVoiceId'
+
+/**
+ * 归一化一个开关型配置值。
+ *
+ * 只有显式为真才算开：`'true'`、布尔 `true`。写错的人得到关，而不是一个让人
+ * 去猜的校验错误——关是"和以前一样"，开才会改变所有回答的读法。
+ * @param raw - 配置里的值。
+ * @returns 是否开启。
+ */
+export function normalizeFlag(raw) {
+  if (raw === true) return true
+  return String(raw ?? '').trim().toLowerCase() === 'true'
+}
+
 /**
  * 构建持久化的语音设置 schema。
  * @param z - schemastery 入口，从 harness 安装处解析。
@@ -63,5 +85,14 @@ export function voiceSettingsSchema(z) {
     mode: z.string().default(MODE_ONE_SHOT),
     /** 打开页面后首次交互时播放一次提示音。 */
     bootSound: z.boolean().default(true),
+    /**
+     * 角色扮演模式。开启后回答里的「」内容按台词处理，其余按旁白处理，两者
+     * 用不同音色合成，再按原文顺序拼成一条音频。
+     */
+    roleplay: z.boolean().default(false),
+    /** 旁白的音色 ID；留空表示跟随当前音色（激活的档案）。 */
+    narrationVoiceId: z.string().default(''),
+    /** 角色台词的音色 ID；留空表示跟随当前音色。 */
+    characterVoiceId: z.string().default(''),
   })
 }

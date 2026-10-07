@@ -112,6 +112,11 @@ let base
 /** 第二台服务器：同样的插件，`mode: 'stream'`。 */
 let streamServer
 let streamBase
+/** 第三台服务器：`mode: 'one-shot'` + 角色扮演开启。 */
+let roleplayServer
+let roleplayBase
+/** 插件发给"百炼"的每一次合成请求，用于断言旁白/台词各发给了谁。 */
+let speakCalls = []
 /**
  * 真正的网络 fetch。
  *
@@ -184,6 +189,9 @@ before(async () => {
   realFetch = globalThis.fetch
   globalThis.fetch = async (url, init) => {
     const target = String(url ?? '')
+    // 角色扮演一次朗读会发好几个请求，所以要把"发给了哪个音色"记下来 ——
+    // 顺序对不对只能在这上面看。
+    if (target.includes('SpeechSynthesizer')) speakCalls.push({ url: target, init })
     // 流式与非流式打的是同一个端点，靠请求头区分 —— 这也是真实链路上的样子。
     if (init?.headers?.['X-DashScope-SSE'] === 'enable') return fakeStream(SSE_BODY)
     if (target.includes('/api/v1/files')) {
@@ -261,6 +269,20 @@ before(async () => {
     mode: 'stream',
   })
 
+  /** 角色扮演那一台：旁白与台词各绑一个音色，便于断言"谁念了哪一段"。 */
+  const roleplay = spareContext()
+  plugin.apply(roleplay.ctx, {
+    apiKey: 'sk-test',
+    voiceId: 'voice-1',
+    model: 'cosyvoice-v3.5-plus',
+    outputDir: join(home, 'audio-roleplay'),
+    bootSound: true,
+    mode: 'one-shot',
+    roleplay: true,
+    narrationVoiceId: 'voice-narration',
+    characterVoiceId: 'voice-character',
+  })
+
   server = serveWith(plain.routes)
   await new Promise((resolveListen) => { server.listen(0, '127.0.0.1', resolveListen) })
   base = `http://127.0.0.1:${String(server.address().port)}`
@@ -268,11 +290,16 @@ before(async () => {
   streamServer = serveWith(realtime.routes)
   await new Promise((resolveListen) => { streamServer.listen(0, '127.0.0.1', resolveListen) })
   streamBase = `http://127.0.0.1:${String(streamServer.address().port)}`
+
+  roleplayServer = serveWith(roleplay.routes)
+  await new Promise((resolveListen) => { roleplayServer.listen(0, '127.0.0.1', resolveListen) })
+  roleplayBase = `http://127.0.0.1:${String(roleplayServer.address().port)}`
 })
 
 after(() => {
   if (server !== undefined) server.close()
   if (streamServer !== undefined) streamServer.close()
+  if (roleplayServer !== undefined) roleplayServer.close()
   delete process.env.DSH_HOME
 })
 
@@ -700,5 +727,86 @@ describe('音色克隆路由', () => {
         body: JSON.stringify({ id: item.id }),
       })
     }
+  })
+})
+
+describe('角色扮演路由', () => {
+  /** 一段带台词的回答：旁白 - 台词 - 旁白。 */
+  const SCRIPT = '他抬起头。「你来了。」他笑了笑。'
+
+  /** 往某一台服务器的 /speak 发一次请求。 */
+  async function speakAt(target, body) {
+    speakCalls = []
+    const response = await realFetch(`${target}/dsh-cosyvoice/speak`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+    return json(response)
+  }
+
+  /** 每次合成请求用的音色，按发出顺序。 */
+  function voicesAsked() {
+    return speakCalls.map(call => JSON.parse(String(call.init.body)).input.voice)
+  }
+
+  it('配置开了角色扮演：一次朗读按段发多次请求', async () => {
+    const spoken = await speakAt(roleplayBase, { text: SCRIPT })
+    assert.equal(spoken.ok, true)
+    assert.equal(spoken.mode, 'one-shot')
+    // 三段，且音色是 旁白 / 台词 / 旁白。
+    assert.deepEqual(voicesAsked(), ['voice-narration', 'voice-character', 'voice-narration'])
+  })
+
+  it('拼出来的产物是 WAV，且能取回', async () => {
+    const spoken = await speakAt(roleplayBase, { text: SCRIPT })
+    assert.equal(spoken.clip.name.endsWith('.wav'), true)
+    const audio = await realFetch(`${roleplayBase}${spoken.clip.url}`)
+    const bytes = Buffer.from(await audio.arrayBuffer())
+    // WAV 头之后应当是三段 FAKE 音频按原文顺序相接 —— 顺序就写在字节里。
+    assert.equal(bytes.subarray(0, 4).toString(), 'RIFF')
+    assert.equal(bytes.length, 44 + 3 * FAKE_AUDIO.length)
+  })
+
+  it('关着的那一台仍然只发一次请求', async () => {
+    const spoken = await speakAt(base, { text: SCRIPT })
+    assert.equal(spoken.ok, true)
+    assert.equal(speakCalls.length, 1)
+    assert.deepEqual(voicesAsked(), ['voice-1'])
+  })
+
+  it('请求里的 roleplay 覆盖配置', async () => {
+    // 配置开着，但这一次明确说不用 —— 于是只发一次、用当前音色。
+    await speakAt(roleplayBase, { text: SCRIPT, roleplay: false })
+    assert.deepEqual(voicesAsked(), ['voice-1'])
+    // 反过来说要用，即使配置关着也照办。
+    await speakAt(base, { text: SCRIPT, roleplay: true })
+    assert.equal(speakCalls.length, 3)
+  })
+
+  it('请求里的音色覆盖配置里的绑定', async () => {
+    await speakAt(roleplayBase, {
+      text: SCRIPT,
+      narrationVoiceId: 'req-narration',
+      characterVoiceId: 'req-character',
+    })
+    assert.deepEqual(voicesAsked(), ['req-narration', 'req-character', 'req-narration'])
+  })
+
+  it('没有台词时不分段', async () => {
+    await speakAt(roleplayBase, { text: '整段都是旁白，没有一句台词。' })
+    assert.deepEqual(voicesAsked(), ['voice-narration'])
+  })
+
+  it('/status 回报角色扮演开关与两个绑定音色', async () => {
+    const body = await json(await realFetch(`${roleplayBase}/dsh-cosyvoice/status`))
+    assert.equal(body.roleplay, true)
+    assert.equal(body.narrationVoiceId, 'voice-narration')
+    assert.equal(body.characterVoiceId, 'voice-character')
+
+    // 问"按关闭来算"：回报的应当是那一次会真正生效的值。
+    const off = await json(await realFetch(`${roleplayBase}/dsh-cosyvoice/status?roleplay=false`))
+    assert.equal(off.roleplay, false)
+    assert.equal(off.configuredRoleplay, true)
   })
 })

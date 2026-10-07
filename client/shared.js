@@ -64,6 +64,87 @@ function saveMode(value) {
   }
 }
 
+/** 角色扮演开关的存储键。 */
+var ROLEPLAY_KEY = 'dsh-cosyvoice.roleplay'
+
+/** 旁白音色的存储键。 */
+var NARRATION_KEY = 'dsh-cosyvoice.narrationVoice'
+
+/** 角色音色的存储键。 */
+var CHARACTER_KEY = 'dsh-cosyvoice.characterVoice'
+
+/** localStorage 不可用时的兜底：键 → 值。 */
+var prefMemory = {}
+
+/**
+ * 读一个本机偏好。
+ *
+ * 与合成方式同一套道理：绑定音色也好、开关也好，走宿主配置通道都可能被拒，
+ * 而"改了没反应"是不可接受的。所以本机先记一份，每次朗读请求带上，服务端
+ * 见到就用它 —— 页面内当场生效，配置写得进去就顺带持久化。
+ * @param key - 存储键。
+ * @returns 存过的值；**没存过是 null，存过空串是空串** —— 这个区别有意义：
+ *   "跟随当前音色"就是存一个空串，而没存过应当听配置的。
+ */
+function readPref(key) {
+  if (Object.prototype.hasOwnProperty.call(prefMemory, key)) return prefMemory[key]
+  try {
+    if (window.localStorage !== undefined && window.localStorage !== null) {
+      var stored = window.localStorage.getItem(key)
+      return stored === null || stored === undefined ? null : String(stored)
+    }
+  } catch (error) {
+    // 读不到就当没存过。
+  }
+  return null
+}
+
+/**
+ * 写一个本机偏好。
+ * @param key - 存储键。
+ * @param value - 值；空串表示"清掉，重新听配置的"。
+ */
+function savePref(key, value) {
+  prefMemory[key] = value
+  try {
+    if (window.localStorage !== undefined && window.localStorage !== null) {
+      window.localStorage.setItem(key, value)
+    }
+  } catch (error) {
+    // 存不下也不影响这一页。
+  }
+}
+
+/** @returns `'true'` / `'false'` / `''`（没选过）。 */
+function readRoleplay() {
+  return readPref(ROLEPLAY_KEY) === 'true' ? 'true' : readPref(ROLEPLAY_KEY) === 'false' ? 'false' : ''
+}
+
+/** @param on - 是否开启。 */
+function saveRoleplay(on) {
+  savePref(ROLEPLAY_KEY, on ? 'true' : 'false')
+}
+
+/** @returns 绑定的旁白音色 ID；没存过是 null，存过"跟随"是空串。 */
+function readNarrationVoice() {
+  return readPref(NARRATION_KEY)
+}
+
+/** @param id - 旁白音色 ID。 */
+function saveNarrationVoice(id) {
+  savePref(NARRATION_KEY, String(id === undefined || id === null ? '' : id))
+}
+
+/** @returns 绑定的角色音色 ID；没存过是 null，存过"跟随"是空串。 */
+function readCharacterVoice() {
+  return readPref(CHARACTER_KEY)
+}
+
+/** @param id - 角色音色 ID。 */
+function saveCharacterVoice(id) {
+  savePref(CHARACTER_KEY, String(id === undefined || id === null ? '' : id))
+}
+
 /** 主机名主题 token，每个都带兜底，缺 token 时降级而不是变空白。 */
 var T = {
   text: 'var(--dsw-alias-label-primary, inherit)',
@@ -471,6 +552,17 @@ async function speakAs(action, body, messageId) {
   // 于是切换是**当场生效**的，不必等宿主把配置写回去。
   var wanted = readMode()
   if (wanted !== '') payload.mode = wanted
+
+  // 角色扮演同理：开关与两个音色都随请求走，服务端见了就用。写配置是"顺带"，
+  // 写不进去也不会让这一次朗读回到旧的读法。
+  var roleplay = readRoleplay()
+  if (roleplay === 'true') payload.roleplay = true
+  else if (roleplay === 'false') payload.roleplay = false
+  // 空串是有意义的（"跟随当前音色"），但那该由配置去表达，不必占用请求体。
+  var narrationVoice = readNarrationVoice()
+  if (narrationVoice !== null && narrationVoice !== '') payload.narrationVoiceId = narrationVoice
+  var characterVoice = readCharacterVoice()
+  if (characterVoice !== null && characterVoice !== '') payload.characterVoiceId = characterVoice
 
   var response
   try {

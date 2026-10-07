@@ -34,6 +34,15 @@ export const EXT_ONE_SHOT = 'mp3'
 export const EXT_STREAM = 'wav'
 
 /**
+ * 一切 PCM 拼接产物的扩展名。
+ *
+ * 实时流式、以及角色扮演的多段合成，拿到的都是裸 PCM，补一个 WAV 头才能播。
+ * 两者格式一样，于是共用这一个扩展名（值与 {@link EXT_STREAM} 相同，分开命名
+ * 只是为了让调用处读起来是在说"这是一份拼出来的 WAV"）。
+ */
+export const EXT_WAV = 'wav'
+
+/**
  * 一个缓存名该用什么 Content-Type 回应。
  * @param name - 缓存文件名。
  * @returns MIME 类型。
@@ -51,6 +60,24 @@ export function mimeOf(name) {
  */
 export function cacheKeyOf(model, voiceId, text) {
   return createHash('sha256').update(`${model}\n${voiceId}\n${text}`, 'utf8').digest('hex')
+}
+
+/**
+ * 计算一次**多段**合成的缓存键。
+ *
+ * 角色扮演下一次朗读要发好几个请求，每个都有自己的音色。缓存键必须把"哪一段
+ * 用了哪个音色"都算进去：只按全文算的话，换了角色音色却命中旧缓存，念出来还是
+ * 旧声音——那种 bug 极难发现，因为一切看起来都成功了。
+ *
+ * 段之间用控制字符分隔，避免正文里恰好出现分隔符时把两段的内容接成别的意思。
+ * @param parts - 段序列，每段带 `kind` / `model` / `voiceId` / `text`。
+ * @returns 64 位十六进制字符串。
+ */
+export function cacheKeyOfParts(parts) {
+  const seed = parts
+    .map(part => `${part.kind}\u0001${part.model}\u0001${part.voiceId}\u0001${part.text}`)
+    .join('\u0002')
+  return createHash('sha256').update(seed, 'utf8').digest('hex')
 }
 
 /**

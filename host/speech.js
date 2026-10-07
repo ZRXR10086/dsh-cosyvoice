@@ -35,8 +35,16 @@ export const SSE_HEADER = 'X-DashScope-SSE'
 /** 流式链路请求头的值。 */
 export const SSE_ENABLED = 'enable'
 
-/** 流式链路的采样率；与 {@link import('./stream.js').STREAM_SAMPLE_RATE} 同一个值。 */
-const STREAM_SAMPLE_RATE = 24000
+/**
+ * 一切 PCM 产物的采样率。
+ *
+ * 请求里带 `sample_rate`，云端返回的 PCM 就按这个来；角色扮演要把多段音频直接
+ * 拼起来，**采样率必须一致**才不会变调，所以整条链路只用这一个值。
+ */
+export const PCM_SAMPLE_RATE = 24000
+
+/** 流式链路的采样率；与 {@link PCM_SAMPLE_RATE} 同一个值。 */
+const STREAM_SAMPLE_RATE = PCM_SAMPLE_RATE
 
 /**
  * 把一段回答文本整理成"适合朗读"的纯文本。
@@ -167,11 +175,12 @@ export class SpeechClient {
    * 合成一段文本，返回音频字节。
    * @param rawText - 要朗读的文本（可以是 Markdown，会先清洗）。
    * @param identity - 本次要用的模型与音色；省略时用设置里的回退值。
+   * @param format - 云端返回的音频格式；角色扮演要拼音频，所以用裸 `pcm`。
    * @returns 音频字节、使用的音色与模型、以及字符用量。
    * @throws {Error} 配置缺失或合成失败时抛出（消息可直接展示给用户）。
    */
-  async synthesize(rawText, identity) {
-    const { text, apiKey, model, voiceId, payload } = this.prepare(rawText, identity, 'mp3')
+  async synthesize(rawText, identity, format = 'mp3') {
+    const { text, apiKey, model, voiceId, payload } = this.prepare(rawText, identity, format)
     let response
     try {
       response = await fetchWithTimeout(this.fetchImpl, this.endpoint, {
@@ -210,6 +219,70 @@ export class SpeechClient {
   }
 
   /**
+   * 开一条流，但**不开始消费**。
+   *
+   * 角色扮演要同时念旁白和台词：两条流都得先发出去，否则第二条要等第一条收完
+   * 才起飞，段与段之间就多出一次完整的网络往返——那正是 v2 分句方案被吐槽
+   * "间隔太大"的原因。
+   *
+   * 而 async generator 的函数体在第一次 `next()` 才执行，直接 `map` 出一堆
+   * generator 是一个请求都不会发出去的。所以这里把 fetch 装进一个立即启动的
+   * promise（返回时请求已经在飞），generator 只负责等它、然后按块往外吐。
+   * @param rawText - 要朗读的文本（可以是 Markdown，会先清洗）。
+   * @param identity - 本次要用的模型与音色；省略时用设置里的回退值。
+   * @returns `{ frames }`：一个尚未开始消费的异步迭代器。
+   * @throws {Error} 配置缺失时**同步**抛出（还没发请求，不必去等流）。
+   */
+  openStream(rawText, identity) {
+    // prepare 放在外面同步执行：Key 没配、音色没配这类问题应当在发起任何请求
+    // 之前就报出来，而不是等第一条流读了一半才炸。
+    const { apiKey, model, voiceId, payload } = this.prepare(rawText, identity, 'pcm')
+
+    const pending = (async () => {
+      let response
+      try {
+        response = await fetchWithTimeout(this.fetchImpl, this.endpoint, {
+          method: 'POST',
+          headers: {
+            authorization: `Bearer ${apiKey}`,
+            'content-type': 'application/json',
+            [SSE_HEADER]: SSE_ENABLED,
+            accept: 'text/event-stream',
+          },
+          body: JSON.stringify(payload),
+        }, this.timeoutMs)
+      } catch (error) {
+        throw new Error(`无法连接百炼服务：${error instanceof Error ? error.message : String(error)}`)
+      }
+      if (!response.ok) throw new Error(describeFailure(response.status, await response.text()))
+      return response
+    })()
+    // 多条流并行时，靠后那条可能先失败，而它的 promise 此刻还没人 await。
+    // 挂一个空 catch 把这次拒绝认领掉，免得冒出 unhandled rejection。
+    pending.catch(() => {})
+
+    const sampleRate = STREAM_SAMPLE_RATE
+    async function * frames() {
+      const response = await pending
+      let sawAudio = false
+      for await (const frame of readSse(response.body)) {
+        const event = interpretSseFrame(frame)
+        if (event.kind === 'audio') {
+          sawAudio = true
+          yield { kind: 'audio', bytes: Buffer.from(event.base64, 'base64'), sampleRate }
+        } else if (event.kind === 'failed') {
+          throw new Error(event.message)
+        } else if (event.kind === 'finish') {
+          yield { kind: 'finish', url: event.url, characters: event.characters, model, voiceId }
+        }
+      }
+      if (!sawAudio) throw new Error('百炼没有返回音频数据，请稍后重试。')
+    }
+
+    return { frames: frames() }
+  }
+
+  /**
    * 流式合成：边合成边把音频块交出来。
    *
    * 生成器而不是回调，是因为"第一块到达""流走完了"这两个时刻由调用方决定怎么写
@@ -221,38 +294,7 @@ export class SpeechClient {
    * @throws {Error} 配置缺失、请求被拒或云端报失败时抛出。
    */
   async * stream(rawText, identity) {
-    const { apiKey, model, voiceId, payload } = this.prepare(rawText, identity, 'pcm')
-    let response
-    try {
-      response = await fetchWithTimeout(this.fetchImpl, this.endpoint, {
-        method: 'POST',
-        headers: {
-          authorization: `Bearer ${apiKey}`,
-          'content-type': 'application/json',
-          [SSE_HEADER]: SSE_ENABLED,
-          accept: 'text/event-stream',
-        },
-        body: JSON.stringify(payload),
-      }, this.timeoutMs)
-    } catch (error) {
-      throw new Error(`无法连接百炼服务：${error instanceof Error ? error.message : String(error)}`)
-    }
-
-    if (!response.ok) throw new Error(describeFailure(response.status, await response.text()))
-
-    let sawAudio = false
-    for await (const frame of readSse(response.body)) {
-      const event = interpretSseFrame(frame)
-      if (event.kind === 'audio') {
-        sawAudio = true
-        yield { kind: 'audio', bytes: Buffer.from(event.base64, 'base64'), sampleRate: STREAM_SAMPLE_RATE }
-      } else if (event.kind === 'failed') {
-        throw new Error(event.message)
-      } else if (event.kind === 'finish') {
-        yield { kind: 'finish', url: event.url, characters: event.characters, model, voiceId }
-      }
-    }
-    if (!sawAudio) throw new Error('百炼没有返回音频数据，请稍后重试。')
+    yield * this.openStream(rawText, identity).frames
   }
 
   /**
