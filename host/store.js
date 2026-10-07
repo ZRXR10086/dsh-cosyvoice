@@ -18,8 +18,29 @@ import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } f
 import { join } from 'node:path'
 import { dshHome } from './harness.js'
 
-/** 缓存文件名：`<64位十六进制>.mp3`，纯哈希，不含时间戳。 */
-const CACHE_NAME = /^[0-9a-f]{64}\.mp3$/
+/**
+ * 缓存文件名：`<64位十六进制>.mp3` 或 `.wav`。
+ *
+ * 两种扩展名是非实时与实时两条链路各自的产物：前者拿到的是 MP3，后者是 16 位
+ * PCM 裸数据、需要由 {@link import('./stream.js').wavFromPcm} 补上 WAV 头才能听。
+ * 分开命名于是同一段文字在两种模式下各有各的缓存，互不覆盖也互不当责。
+ */
+const CACHE_NAME = /^[0-9a-f]{64}\.(?:mp3|wav)$/
+
+/** 非实时链路的产物扩展名。 */
+export const EXT_ONE_SHOT = 'mp3'
+
+/** 实时链路的产物扩展名。 */
+export const EXT_STREAM = 'wav'
+
+/**
+ * 一个缓存名该用什么 Content-Type 回应。
+ * @param name - 缓存文件名。
+ * @returns MIME 类型。
+ */
+export function mimeOf(name) {
+  return String(name ?? '').endsWith('.wav') ? 'audio/wav' : 'audio/mpeg'
+}
 
 /**
  * 计算缓存键。
@@ -66,19 +87,21 @@ export class AudioStore {
   /**
    * 缓存文件名。
    * @param key - 缓存键。
+   * @param ext - 产物扩展名；默认 MP3。
    * @returns 文件名。
    */
-  nameOf(key) {
-    return `${key}.mp3`
+  nameOf(key, ext = EXT_ONE_SHOT) {
+    return `${key}.${ext}`
   }
 
   /**
    * 命中缓存则返回该音频的描述。
    * @param key - 缓存键。
+   * @param ext - 产物扩展名；默认 MP3。
    * @returns 名称、绝对路径与大小；未命中返回 undefined。
    */
-  hit(key) {
-    const name = this.nameOf(key)
+  hit(key, ext = EXT_ONE_SHOT) {
+    const name = this.nameOf(key, ext)
     const path = join(this.dir(), name)
     if (!existsSync(path)) return undefined
     try {
@@ -92,11 +115,12 @@ export class AudioStore {
    * 写入一段音频（同名即覆盖，因为同键必然同内容）。
    * @param key - 缓存键。
    * @param bytes - 音频字节。
+   * @param ext - 产物扩展名；默认 MP3。
    * @returns 名称、绝对路径与大小。
    */
-  put(key, bytes) {
+  put(key, bytes, ext = EXT_ONE_SHOT) {
     const dir = this.ensure()
-    const name = this.nameOf(key)
+    const name = this.nameOf(key, ext)
     const path = join(dir, name)
     writeFileSync(path, bytes)
     return { name, path, bytes: bytes.length }

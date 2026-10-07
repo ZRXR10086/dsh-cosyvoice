@@ -12,7 +12,8 @@
  */
 
 import { MAX_TEXT_CHARS, normalizeText } from './speech.js'
-import { cacheKeyOf } from './store.js'
+import { cacheKeyOf, EXT_STREAM, EXT_ONE_SHOT } from './store.js'
+import { STREAM_SAMPLE_RATE, wavFromPcm } from './stream.js'
 
 /**
  * 带内容哈希缓存的语音合成器。
@@ -77,7 +78,7 @@ export class VoiceSynthesizer {
     const { model, voiceId } = this.identity()
     const key = cacheKeyOf(model, voiceId, text)
 
-    const cached = this.store.hit(key)
+    const cached = this.store.hit(key, EXT_ONE_SHOT)
     if (cached !== undefined) {
       this.log(`synth: 命中缓存 ${cached.name}（${String(cached.bytes)} 字节）`)
       return { ...cached, cached: true, text, characters: 0 }
@@ -87,8 +88,59 @@ export class VoiceSynthesizer {
     // 否则同一段超长文本在截断前后会算出两个键，白付一次钱。
     const clipped = text.length > MAX_TEXT_CHARS ? text.slice(0, MAX_TEXT_CHARS) : text
     const result = await this.speech.synthesize(clipped, { model, voiceId })
-    const clip = this.store.put(key, result.bytes)
+    const clip = this.store.put(key, result.bytes, EXT_ONE_SHOT)
     this.log(`synth: 已合成 ${clip.name}（${String(clip.bytes)} 字节，计费 ${String(result.characters)} 字符）`)
     return { ...clip, cached: false, text: clipped, characters: result.characters }
+  }
+
+  /**
+   * 流式合成：一边把音频块交出去，一边攒完整的音频以便下次命中缓存。
+   *
+   * 产出顺序有意为之：**每一块到达就立刻 yield**，这份响应在 HTTP 层会变成一帧
+   * SSE，落到浏览器就是"第一句出来就开始响"。全部合成完之后才补一个 `ready`，届时
+   * 整段音频已经落成 WAV —— 于是同一条回答第二次播不再付第二次钱，也不再有任何
+   * 等待。
+   *
+   * 缓存命中时不产生任何 `audio` 帧：直接给一个 `ready`，让路由按普通 JSON 回给
+   * 浏览器去整段播。既然音频已经在磁盘上，再假装流一次只会更慢。
+   * @param rawText - 要朗读的文本（可以是 Markdown，会先清洗）。
+   * @returns 依次为音频块与终帧。
+   * @throws {Error} 配置缺失或合成失败时抛出（消息可直接展示给用户）。
+   */
+  async * stream(rawText) {
+    const text = normalizeText(rawText)
+    if (text === '') throw new Error('没有可朗读的文本。')
+
+    const { model, voiceId } = this.identity()
+    const key = cacheKeyOf(model, voiceId, text)
+
+    const cached = this.store.hit(key, EXT_STREAM)
+    if (cached !== undefined) {
+      this.log(`synth: 流式命中缓存 ${cached.name}（${String(cached.bytes)} 字节）`)
+      yield { kind: 'ready', clip: { ...cached, cached: true, characters: 0 } }
+      return
+    }
+
+    // 长文本在清洗后才截断，所以缓存键算的是"真正会发出去的内容"。
+    const clipped = text.length > MAX_TEXT_CHARS ? text.slice(0, MAX_TEXT_CHARS) : text
+    const chunks = []
+    let characters = 0
+    let rate = STREAM_SAMPLE_RATE
+
+    for await (const frame of this.speech.stream(clipped, { model, voiceId })) {
+      if (frame.kind === 'audio') {
+        chunks.push(frame.bytes)
+        rate = frame.sampleRate
+        yield { kind: 'audio', bytes: frame.bytes, sampleRate: frame.sampleRate }
+        continue
+      }
+      if (frame.kind === 'finish') characters = frame.characters
+    }
+
+    const whole = Buffer.concat(chunks)
+    if (whole.length === 0) throw new Error('合成返回的音频为空，请稍后重试。')
+    const clip = this.store.put(key, wavFromPcm(whole, rate), EXT_STREAM)
+    this.log(`synth: 流式合成 ${clip.name}（${String(clip.bytes)} 字节，计费 ${String(characters)} 字符）`)
+    yield { kind: 'ready', clip: { ...clip, cached: false, characters } }
   }
 }

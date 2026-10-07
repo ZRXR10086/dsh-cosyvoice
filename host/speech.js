@@ -1,6 +1,12 @@
 /**
  * 与阿里云百炼（DashScope）非实时语音合成 HTTP 接口的对话。
  *
+ * 两条链路，同一个端点：
+ *
+ * - **非实时**：一次 POST 拿回整条音频（默认）。语调最连贯，代价是要等全文合成完；
+ * - **实时**：加上 `X-DashScope-SSE: enable`，云端按句把 PCM 推回来，
+ *   第一句合成完就能出声。
+ *
  * 两个决定塑造了这个文件：
  *
  * **fetch 可注入。** 客户端接收一个可注入的 fetch 实现，于是测试可以塞进假 fetch
@@ -11,6 +17,9 @@
  * @module dsh-cosyvoice/speech
  */
 
+import { DEFAULT_MODEL } from './settings.js'
+import { interpretSseFrame, readSse } from './stream.js'
+
 /** 合成接口地址（华北2北京；非流式返回音频 URL）。 */
 export const DEFAULT_ENDPOINT = 'https://dashscope.aliyuncs.com/api/v1/services/audio/tts/SpeechSynthesizer'
 
@@ -19,6 +28,15 @@ export const MAX_TEXT_CHARS = 20000
 
 /** 单次请求的超时（毫秒）。合成是长任务，但不能无限等。 */
 export const REQUEST_TIMEOUT_MS = 120000
+
+/** 打开流式返回的请求头：不带它就是一次普通的、等整段合成完的请求。 */
+export const SSE_HEADER = 'X-DashScope-SSE'
+
+/** 流式链路请求头的值。 */
+export const SSE_ENABLED = 'enable'
+
+/** 流式链路的采样率；与 {@link import('./stream.js').STREAM_SAMPLE_RATE} 同一个值。 */
+const STREAM_SAMPLE_RATE = 24000
 
 /**
  * 把一段回答文本整理成"适合朗读"的纯文本。
@@ -115,13 +133,17 @@ export class SpeechClient {
   }
 
   /**
-   * 合成一段文本，返回音频字节。
-   * @param rawText - 要朗读的文本（可以是 Markdown，会先清洗）。
+   * 整理一次请求要用的全部材料。
+   *
+   * 两条链路共用，于是"Key 缺失""没给音色""超长截断"这些判定只有一份 ——
+   * 否则流式和非流式迟早会在某一条错误消息上分家。
+   * @param rawText - 原始文本（可以是 Markdown）。
    * @param identity - 本次要用的模型与音色；省略时用设置里的回退值。
-   * @returns 音频字节、使用的音色与模型、以及字符用量。
-   * @throws {Error} 配置缺失或合成失败时抛出（消息可直接展示给用户）。
+   * @param format - 要云端返回的音频格式。
+   * @returns 文本、凭据与可直接序列化的请求体。
+   * @throws {Error} 配置缺失时抛出（消息可直接展示给用户）。
    */
-  async synthesize(rawText, identity) {
+  prepare(rawText, identity, format) {
     const text = normalizeText(rawText)
     if (text === '') throw new Error('没有可朗读的文本。')
 
@@ -136,8 +158,20 @@ export class SpeechClient {
 
     const payload = {
       model,
-      input: { text, voice: voiceId, format: 'mp3', sample_rate: 24000 },
+      input: { text, voice: voiceId, format, sample_rate: STREAM_SAMPLE_RATE },
     }
+    return { text, apiKey, model, voiceId, payload }
+  }
+
+  /**
+   * 合成一段文本，返回音频字节。
+   * @param rawText - 要朗读的文本（可以是 Markdown，会先清洗）。
+   * @param identity - 本次要用的模型与音色；省略时用设置里的回退值。
+   * @returns 音频字节、使用的音色与模型、以及字符用量。
+   * @throws {Error} 配置缺失或合成失败时抛出（消息可直接展示给用户）。
+   */
+  async synthesize(rawText, identity) {
+    const { text, apiKey, model, voiceId, payload } = this.prepare(rawText, identity, 'mp3')
     let response
     try {
       response = await fetchWithTimeout(this.fetchImpl, this.endpoint, {
@@ -173,6 +207,52 @@ export class SpeechClient {
 
     if (bytes.length === 0) throw new Error('合成返回的音频为空，请稍后重试。')
     return { bytes, model, voiceId, characters: Number(parsed?.usage?.characters ?? text.length) }
+  }
+
+  /**
+   * 流式合成：边合成边把音频块交出来。
+   *
+   * 生成器而不是回调，是因为"第一块到达""流走完了"这两个时刻由调用方决定怎么写
+   * 出去（在 HTTP 层是 SSE 帧），而 generator 让它可以按自己的节奏拉取 —— 顺带
+   * 也让它在测试里被 `for await` 消费时无需任何桩件。
+   * @param rawText - 要朗读的文本（可以是 Markdown，会先清洗）。
+   * @param identity - 本次要用的模型与音色；省略时用设置里的回退值。
+   * @returns 依次为 `{ kind: 'audio', bytes, sampleRate }` 与 `{ kind: 'finish', ... }`。
+   * @throws {Error} 配置缺失、请求被拒或云端报失败时抛出。
+   */
+  async * stream(rawText, identity) {
+    const { apiKey, model, voiceId, payload } = this.prepare(rawText, identity, 'pcm')
+    let response
+    try {
+      response = await fetchWithTimeout(this.fetchImpl, this.endpoint, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${apiKey}`,
+          'content-type': 'application/json',
+          [SSE_HEADER]: SSE_ENABLED,
+          accept: 'text/event-stream',
+        },
+        body: JSON.stringify(payload),
+      }, this.timeoutMs)
+    } catch (error) {
+      throw new Error(`无法连接百炼服务：${error instanceof Error ? error.message : String(error)}`)
+    }
+
+    if (!response.ok) throw new Error(describeFailure(response.status, await response.text()))
+
+    let sawAudio = false
+    for await (const frame of readSse(response.body)) {
+      const event = interpretSseFrame(frame)
+      if (event.kind === 'audio') {
+        sawAudio = true
+        yield { kind: 'audio', bytes: Buffer.from(event.base64, 'base64'), sampleRate: STREAM_SAMPLE_RATE }
+      } else if (event.kind === 'failed') {
+        throw new Error(event.message)
+      } else if (event.kind === 'finish') {
+        yield { kind: 'finish', url: event.url, characters: event.characters, model, voiceId }
+      }
+    }
+    if (!sawAudio) throw new Error('百炼没有返回音频数据，请稍后重试。')
   }
 
   /**

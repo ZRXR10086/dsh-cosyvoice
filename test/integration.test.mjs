@@ -8,6 +8,9 @@
  *
  * 三处刻意的设计：
  *
+ * - **非实时与实时各起一台服务器**：同一份路由代码在两种 `mode` 下各注册一次，
+ *   于是"同一个 HTTP 表面两种形态"这件事是真的被测到的 —— 而不是两边各造一批
+ *   各自的 mocks，proving 不了它们共享的那段代码。
  * - **临时 harness home**：`DSH_HOME` 指向一个临时目录，里面按真实布局放一个
  *   `profiles/node_modules/@deepseek-ai/schemastery` 链接，于是这份测试同时验证了
  *   锚点解析这条路径本身。
@@ -35,6 +38,56 @@ const PACKAGE = resolve(HERE, '..')
 /** 本测试注入的假合成结果：一段固定的"音频"字节。 */
 const FAKE_AUDIO = Buffer.from('FAKE-MP3-BYTES')
 
+/** 流式链路的第一块 PCM（16 位小端，4 个采样）。 */
+const PCM_ONE = Buffer.from([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08])
+
+/** 流式链路的第二块 PCM。 */
+const PCM_TWO = Buffer.from([0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18])
+
+/** 假云端的 SSE 响应体：`X-DashScope-SSE` 打开时用的那一份。 */
+const SSE_BODY = [
+  'event: sentence-begin',
+  'data: {"header":{"event":"sentence-begin"}}',
+  '',
+  'event: sentence-synthesis',
+  `data: {"payload":{"data":"${PCM_ONE.toString('base64')}"}}`,
+  '',
+  'event: sentence-synthesis',
+  `data: {"payload":{"data":"${PCM_TWO.toString('base64')}"}}`,
+  '',
+  'event: sentence-end',
+  'data: {"header":{"event":"sentence-end"},"usage":{"characters":9}}',
+  '',
+  'event: sentence-synthesis',
+  'data: {"header":{"event":"sentence-synthesis"},"output":{"audio":{"url":"https://audio.example.com/all.wav"}},"usage":{"characters":9}}',
+  '',
+].join('\n')
+
+/**
+ * 假 SSE 响应。
+ *
+ * body 是一整段文本、切成两块投递，于是"一次读到半帧"这条路径也被覆盖 —— 这在
+ * 真实网络上才是常态。
+ * @param body - SSE 文本。
+ * @returns 响应。
+ */
+function fakeStream(body) {
+  const bytes = Buffer.from(body, 'utf8')
+  const half = Math.floor(bytes.length / 2)
+  return {
+    ok: true,
+    status: 200,
+    text: async () => body,
+    body: new ReadableStream({
+      start(controller) {
+        controller.enqueue(bytes.subarray(0, half))
+        controller.enqueue(bytes.subarray(half))
+        controller.close()
+      },
+    }),
+  }
+}
+
 /**
  * HTTP 响应体的 JSON 解析。
  * @param response - 响应。
@@ -56,6 +109,9 @@ function fake(payload) {
 let home
 let server
 let base
+/** 第二台服务器：同样的插件，`mode: 'stream'`。 */
+let streamServer
+let streamBase
 /**
  * 真正的网络 fetch。
  *
@@ -128,6 +184,8 @@ before(async () => {
   realFetch = globalThis.fetch
   globalThis.fetch = async (url, init) => {
     const target = String(url ?? '')
+    // 流式与非流式打的是同一个端点，靠请求头区分 —— 这也是真实链路上的样子。
+    if (init?.headers?.['X-DashScope-SSE'] === 'enable') return fakeStream(SSE_BODY)
     if (target.includes('/api/v1/files')) {
       return fake(init?.body === undefined
         ? { data: { url: 'https://intranet.example.com/a.wav' } }
@@ -147,37 +205,74 @@ before(async () => {
   }
 
   const plugin = await import('../host/index.js')
-  const routes = []
-  const ctx = {
-    effect: (fn) => { fn(); return () => {} },
-    webServer: {
-      register: (route) => { routes.push(route); return () => {} },
-    },
-    logger: { warn: () => {} },
+
+  /**
+   * 一个只提供插件真正用到的三个能力的 ctx。
+   * @returns context 与它会收到的路由。
+   */
+  function spareContext() {
+    const routes = []
+    return {
+      routes,
+      ctx: {
+        effect: (fn) => { fn(); return () => {} },
+        webServer: { register: (route) => { routes.push(route); return () => {} } },
+        logger: { warn: () => {} },
+      },
+    }
   }
-  plugin.apply(ctx, {
+
+  /**
+   * 把一组路由挂到一个真服务器上；分发只看路径，与宿主一致。
+   * @param routes - 要挂的路由。
+   * @returns 服务器。
+   */
+  function serveWith(routes) {
+    return createServer((req, res) => {
+      const path = new URL(req.url ?? '/', 'http://localhost').pathname
+      const route = routes.find(candidate => candidate.path === path)
+      if (route === undefined) {
+        res.writeHead(404).end()
+        return
+      }
+      Promise.resolve(route.handler(req, res)).catch(() => { res.destroy() })
+    })
+  }
+
+  const plain = spareContext()
+  plugin.apply(plain.ctx, {
     apiKey: 'sk-test',
     voiceId: 'voice-1',
     model: 'cosyvoice-v3.5-plus',
     outputDir: join(home, 'audio'),
     bootSound: true,
+    mode: 'one-shot',
   })
 
-  server = createServer((req, res) => {
-    const path = new URL(req.url ?? '/', 'http://localhost').pathname
-    const route = routes.find(candidate => candidate.path === path)
-    if (route === undefined) {
-      res.writeHead(404).end()
-      return
-    }
-    Promise.resolve(route.handler(req, res)).catch(() => { res.destroy() })
+  const realtime = spareContext()
+  plugin.apply(realtime.ctx, {
+    apiKey: 'sk-test',
+    voiceId: 'voice-1',
+    model: 'cosyvoice-v3.5-plus',
+    // 两条链路的产物扩展名不同（mp3 / wav），目录也分开：于是两种缓存互不覆盖，
+    // 断言能看清到底是哪一个命中了。
+    outputDir: join(home, 'audio-stream'),
+    bootSound: true,
+    mode: 'stream',
   })
+
+  server = serveWith(plain.routes)
   await new Promise((resolveListen) => { server.listen(0, '127.0.0.1', resolveListen) })
   base = `http://127.0.0.1:${String(server.address().port)}`
+
+  streamServer = serveWith(realtime.routes)
+  await new Promise((resolveListen) => { streamServer.listen(0, '127.0.0.1', resolveListen) })
+  streamBase = `http://127.0.0.1:${String(streamServer.address().port)}`
 })
 
 after(() => {
   if (server !== undefined) server.close()
+  if (streamServer !== undefined) streamServer.close()
   delete process.env.DSH_HOME
 })
 
@@ -189,30 +284,35 @@ describe('apply', () => {
     assert.equal(body.configured, true)
     assert.equal(body.voiceId, 'voice-1')
     assert.equal(body.count, 0)
+    assert.equal(body.mode, 'one-shot')
     assert.ok(!JSON.stringify(body).includes('sk-test'), 'status 绝不能回传 API Key')
+  })
+
+  it('另一份配置下的 /status 报新的合成方式', async () => {
+    const body = await json(await realFetch(`${streamBase}/dsh-cosyvoice/status`))
+    assert.equal(body.mode, 'stream')
   })
 })
 
 describe('合成路由', () => {
-  it('/speak 分句合成并落盘，/audio 取回同样的字节', async () => {
+  it('/speak 整段一次合成并落盘，/audio 取回同样的字节', async () => {
     const spoken = await json(await realFetch(`${base}/dsh-cosyvoice/speak`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ text: '这是第一条足够长的回答内容，用来验证分句。这是第二条同样足够长的回答内容。' }),
+      body: JSON.stringify({ text: '这是一条要整段合成的回答。第二句也在同一份音频里。' }),
     }))
     assert.equal(spoken.ok, true)
-    assert.equal(spoken.total, 2)
-    // 首句就绪就返回，所以响应里可能只有一段；后面几段由 /segments 续上。
-    assert.ok(spoken.segments.length >= 1)
-    assert.equal(spoken.segments[0].cached, false)
+    assert.equal(spoken.mode, 'one-shot')
+    assert.equal(spoken.clip.cached, false)
+    assert.equal(spoken.clip.name.endsWith('.mp3'), true)
 
-    const audio = await realFetch(`${base}${spoken.segments[0].url}`)
+    const audio = await realFetch(`${base}${spoken.clip.url}`)
     assert.equal(audio.headers.get('content-type'), 'audio/mpeg')
     const bytes = Buffer.from(await audio.arrayBuffer())
     assert.deepEqual(bytes, FAKE_AUDIO)
   })
 
-  it('同一段文本第二次直接命中句子级缓存', async () => {
+  it('同一段文本第二次直接命中缓存', async () => {
     const first = await json(await realFetch(`${base}/dsh-cosyvoice/speak`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -223,9 +323,9 @@ describe('合成路由', () => {
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ text: '缓存测试' }),
     }))
-    assert.equal(first.segments[0].cached, false)
-    assert.equal(second.segments[0].cached, true)
-    assert.equal(second.segments[0].name, first.segments[0].name)
+    assert.equal(first.clip.cached, false)
+    assert.equal(second.clip.cached, true)
+    assert.equal(second.clip.name, first.clip.name)
   })
 
   it('/speak-message 用客户端给的文本，并记住它', async () => {
@@ -243,32 +343,7 @@ describe('合成路由', () => {
       body: JSON.stringify({ messageId: 'm-fresh', sessionId: 's1' }),
     }))
     assert.equal(again.ok, true)
-    assert.equal(again.segments[0].name, spoken.segments[0].name)
-  })
-
-  it('/segments 能把后台补齐的句子续上，查不到任务时给 404', async () => {
-    const spoken = await json(await realFetch(`${base}/dsh-cosyvoice/speak`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ text: '第一句话要足够长才会被切开。第二句话同样需要足够长。第三句话也是一样足够长。第四句话依然足够长。' }),
-    }))
-    const jobId = spoken.jobId
-    assert.equal(typeof jobId, 'string')
-    assert.equal(spoken.total, 4)
-
-    // 等后台把剩下的句子合成完（假 fetch 是瞬时的，但作业是异步跑的）。
-    let view = spoken
-    for (let i = 0; i < 20 && !view.done; i += 1) {
-      await new Promise(resolve => setTimeout(resolve, 20))
-      view = await json(await realFetch(`${base}/dsh-cosyvoice/segments?job=${encodeURIComponent(jobId)}`))
-    }
-    assert.equal(view.done, true)
-    assert.equal(view.segments.length, 4)
-    // 顺序必须和原文一致：乱序填满的槽位对外仍是按序交付的。
-    assert.equal(view.segments[0].name, spoken.segments[0].name)
-
-    const missing = await realFetch(`${base}/dsh-cosyvoice/segments?job=nope`)
-    assert.equal(missing.status, 404)
+    assert.equal(again.clip.name, spoken.clip.name)
   })
 
   it('/speak-message 取不到文本时给 404 和可读提示', async () => {
@@ -283,8 +358,7 @@ describe('合成路由', () => {
     assert.match(body.message, /没找到这条回答的文本/)
   })
 
-  it('/audio 拒绝目录穿越与不合法文件名', async () => {
-    for (const name of ['../../etc/passwd', 'nope.mp3', '']) {
+  it('/audio 拒绝目录穿越与不合法文件名', async () => {    for (const name of ['../../etc/passwd', 'nope.mp3', '']) {
       const response = await realFetch(`${base}/dsh-cosyvoice/audio?name=${encodeURIComponent(name)}`)
       assert.equal(response.status, 404, `name=${name} 应当被拒绝`)
     }
@@ -311,6 +385,112 @@ describe('合成路由', () => {
     })
     assert.equal(response.status, 500)
     assert.match((await json(response)).message, /没有可朗读的文本/)
+  })
+})
+
+/**
+ * 取出一条 SSE 文本里某个事件的数据。
+ * @param text - SSE 文本。
+ * @param event - 事件名。
+ * @returns 数据行；没有该事件时返回 undefined。
+ */
+function dataLines(text, event) {
+  const out = []
+  const lines = text.split('\n')
+  for (let i = 0; i < lines.length; i += 1) {
+    if (lines[i] !== `event: ${event}`) continue
+    for (let j = i + 1; j < lines.length; j += 1) {
+      if (!lines[j].startsWith('data: ')) break
+      out.push(JSON.parse(lines[j].slice('data: '.length)))
+    }
+  }
+  return out
+}
+
+describe('实时（流式）合成路由', () => {
+  it('/speak 改成 SSE：开放帧 → 音频块 → 收尾给整段地址', async () => {
+    const response = await realFetch(`${streamBase}/dsh-cosyvoice/speak`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ text: '流式合成的第一句。这是第二句。' }),
+    })
+    assert.equal(response.status, 200)
+    assert.match(String(response.headers.get('content-type')), /text\/event-stream/)
+    const text = await response.text()
+
+    // 一上来就有一帧 open：浏览器不必等到第一块音频才知道连接已经建立。
+    assert.ok(text.includes('event: open'), '开头应当有一帧 open')
+    const chunks = dataLines(text, 'chunk')
+    assert.equal(chunks.length, 2)
+    // 每一块就是云端推下来的那一块 PCM，一个字节不多一个字节不少。
+    assert.deepEqual(Buffer.from(chunks[0].audio, 'base64'), PCM_ONE)
+    assert.deepEqual(Buffer.from(chunks[1].audio, 'base64'), PCM_TWO)
+    assert.equal(chunks[0].sampleRate, 24000)
+
+    const done = dataLines(text, 'done')
+    assert.equal(done.length, 1)
+    assert.equal(done[0].clip.cached, false)
+    assert.equal(done[0].clip.name.endsWith('.wav'), true)
+    assert.equal(done[0].characters, 9)
+
+    // 完整音频已经落盘：WAV 头之后正是那两块 PCM 拼起来的样子。
+    const audio = await realFetch(`${streamBase}${done[0].clip.url}`)
+    assert.equal(audio.headers.get('content-type'), 'audio/wav')
+    const bytes = Buffer.from(await audio.arrayBuffer())
+    assert.equal(bytes.subarray(0, 4).toString('ascii'), 'RIFF')
+    assert.equal(bytes.subarray(8, 12).toString('ascii'), 'WAVE')
+    assert.deepEqual(bytes.subarray(44), Buffer.concat([PCM_ONE, PCM_TWO]))
+  })
+
+  it('同一段文本第二次直接给整段地址，不再假装流式', async () => {
+    const body = JSON.stringify({ text: '流式缓存测试' })
+    const post = () => realFetch(`${streamBase}/dsh-cosyvoice/speak`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body,
+    })
+
+    // 第一次是真流式：整缓存还没生成，所以一帧 SSE 也省不掉。
+    const streamed = dataLines(await (await post()).text(), 'done')
+    assert.equal(streamed.length, 1)
+    assert.equal(streamed[0].clip.cached, false)
+
+    // 第二次缓存已经在磁盘上了，回 JSON 让它整段取，比再流一次更快也更省。
+    const again = await json(await post())
+    assert.equal(again.clip.cached, true)
+    assert.equal(again.clip.name, streamed[0].clip.name)
+  })
+
+  it('实时模式下配置缺失也走 SSE 的 error 帧', async () => {
+    const response = await realFetch(`${streamBase}/dsh-cosyvoice/speak`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ text: '  ' }),
+    })
+    // 空文本在写下第一帧之前就失败，于是还能用普通 JSON 报错。
+    assert.equal(response.status, 500)
+    assert.match((await json(response)).message, /没有可朗读的文本/)
+  })
+
+  it('流式与非流式的缓存各占一个文件名，互不覆盖', async () => {
+    const text = '两条链路各自缓存'
+    const once = await json(await realFetch(`${base}/dsh-cosyvoice/speak`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ text }),
+    }))
+    const realtime = dataLines(await (await realFetch(`${streamBase}/dsh-cosyvoice/speak`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ text }),
+    })).text(), 'done')
+    assert.equal(realtime.length, 1)
+    // 同一段文字，两个名字：换模式不会白付第二次钱，也不会拿错音频。
+    assert.notEqual(once.clip.name, realtime[0].clip.name)
+    const onceAudio = await realFetch(`${base}${once.clip.url}`)
+    const realtimeAudio = await realFetch(`${streamBase}${realtime[0].clip.url}`)
+    assert.equal(onceAudio.headers.get('content-type'), 'audio/mpeg')
+    assert.equal(realtimeAudio.headers.get('content-type'), 'audio/wav')
   })
 })
 

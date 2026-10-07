@@ -20,6 +20,24 @@ export const VOICE_NAMESPACE = 'cosyvoice'
 /** 默认合成模型。必须与音色注册时使用的模型一致。 */
 export const DEFAULT_MODEL = 'cosyvoice-v3.5-plus'
 
+/** 非实时：整段文本一次合成，拿到完整音频才播（默认；语调最连贯）。 */
+export const MODE_ONE_SHOT = 'one-shot'
+
+/** 实时：开启百炼 SSE，第一句合成出来就开始播，边合成边播。 */
+export const MODE_STREAM = 'stream'
+
+/**
+ * 归一化一个 mode 配置值。
+ *
+ * 只有一个值被认作实时，其余一律落到非实时：这是一个开关而不是枚举成员 Unknown，
+ * 写错的人应当得到一个"能出声的默认值"，而不是一条要用户去猜的校验错误。
+ * @param raw - 配置里的值。
+ * @returns {@link MODE_STREAM} 或 {@link MODE_ONE_SHOT}。
+ */
+export function normalizeMode(raw) {
+  return String(raw ?? '').trim() === MODE_STREAM ? MODE_STREAM : MODE_ONE_SHOT
+}
+
 /** 承载百炼 API Key 的字段。密钥：在所有通道上脱敏。 */
 export const API_KEY_FIELD = 'apiKey'
 
@@ -38,6 +56,11 @@ export function voiceSettingsSchema(z) {
     voiceId: z.string().default(''),
     /** 合成音频的落盘目录。留空表示使用插件自己在 harness home 下的目录。 */
     outputDir: z.string().default(''),
+    /**
+     * 合成方式：`stream` 为实时（SSE 边合成边播），`one-shot` 为整段合成后播放。
+     * 以外的任何值都落到 one-shot，所以手改配置不会让播放键失效。
+     */
+    mode: z.string().default(MODE_ONE_SHOT),
     /** 打开页面后首次交互时播放一次提示音。 */
     bootSound: z.boolean().default(true),
   })

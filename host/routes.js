@@ -16,6 +16,9 @@
 
 import { createReadStream, existsSync } from 'node:fs'
 import { MAX_UPLOAD_BYTES, modelFromVoiceId } from './clone.js'
+import { MODE_ONE_SHOT, MODE_STREAM, normalizeMode } from './settings.js'
+import { STREAM_SAMPLE_RATE } from './stream.js'
+import { mimeOf } from './store.js'
 
 /** 接受的 JSON 请求体上限（字节）。文本很短，更大的都是误用或攻击。 */
 const MAX_BODY_BYTES = 256 * 1024
@@ -123,7 +126,7 @@ function readBytes(req, limit) {
  */
 function sendAudio(res, path, cacheable) {
   res.writeHead(200, {
-    'content-type': 'audio/mpeg',
+    'content-type': mimeOf(path),
     'cache-control': cacheable ? 'private, max-age=31536000, immutable' : 'no-store',
   })
   const stream = createReadStream(path)
@@ -131,12 +134,48 @@ function sendAudio(res, path, cacheable) {
   stream.pipe(res)
 }
 
+/** SSE 响应头；`x-accel-buffering` 是给反向代理看的：别替我攒着。 */
+const SSE_HEADERS = {
+  'content-type': 'text/event-stream; charset=utf-8',
+  'cache-control': 'no-cache, no-transform',
+  connection: 'keep-alive',
+  'x-accel-buffering': 'no',
+}
+
+/**
+ * 写回应流式的一组 SSE 头。
+ * @param res - 要接管的响应。
+ */
+function openSse(res) {
+  res.writeHead(200, SSE_HEADERS)
+  // Node 的 http.ServerResponse 有它；某个壳层实现没有时也不影响流的语义。
+  if (typeof res.flushHeaders === 'function') res.flushHeaders()
+}
+
+/**
+ * 写一帧 SSE。
+ *
+ * 写失败不抛：浏览器关掉了页面或点了停止是最常见的原因，而那不是错误 —— 继续
+ * 往一条已经断掉的响应上写，只会让整次流式以一个看起来像 bug 的异常收场。
+ * @param res - 已被 {@link openSse} 接管的响应。
+ * @param event - 事件名。
+ * @param data - 可序列化的载荷。
+ * @returns 是否真的写了出去。
+ */
+function sendFrame(res, event, data) {
+  try {
+    res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
+    return true
+  } catch {
+    return false
+  }
+}
+
 /**
  * 构建本插件的路由。
  * @param options - 每个路由需要的协作者。
  * @param options.getSettings - 读取当前语音设置。
  * @param options.synth - 带缓存的合成器。
- * @param options.segments - 分句合成的作业编排。
  * @param options.store - 音频目录。
  * @param options.texts - messageId → 文本 的解析器。
  * @param options.profiles - 音色档案。
@@ -146,7 +185,13 @@ function sendAudio(res, path, cacheable) {
  * @param options.log - 诊断输出（不进响应）。
  * @returns 顺序稳定的路由注册项。
  */
-export function cosyvoiceRoutes({ getSettings, synth, segments, store, texts, profiles, cloner, bootClip, openDir, log }) {
+export function cosyvoiceRoutes({ getSettings, synth, store, texts, profiles, cloner, bootClip, openDir, log }) {
+  /**
+   * 当前生效的合成方式。每次都读 —— 切换模式不需要重启。
+   * @returns {@link import('./settings.js').MODE_STREAM} 或 {@link import('./settings.js').MODE_ONE_SHOT}。
+   */
+  const modeOf = () => normalizeMode((getSettings() ?? {}).mode)
+
   /**
    * 给一段音频补上浏览器该去取的 URL。
    * @param clip - 音频描述。
@@ -161,25 +206,62 @@ export function cosyvoiceRoutes({ getSettings, synth, segments, store, texts, pr
   })
 
   /**
-   * 给一个作业视图里的每一段补上浏览器该去取的 URL。
-   * @param view - 作业视图。
-   * @returns 带 url 的视图。
+   * 流式出口：云端的每一句一就绪就写一帧给浏览器。
+   *
+   * 命中缓存时不握手 SSE —— 音频已经在磁盘上了，回一个整段地址让浏览器去取，
+   * 比假装再流一次更快也更省。
+   * @param res - 响应。
+   * @param text - 要朗读的文本。
+   * @throws {Error} 合成失败时抛出，由 {@link respond} 翻译成响应。
    */
-  const describeSegments = view => ({ ...view, segments: view.segments.map(describe) })
+  const streamInto = async (res, text) => {
+    let opened = false
+    for await (const frame of synth.stream(text)) {
+      if (frame.kind === 'ready' && !opened) {
+        return sendJson(res, 200, { ok: true, mode: MODE_STREAM, clip: describe(frame.clip) })
+      }
+      if (!opened) {
+        openSse(res)
+        opened = true
+        if (!sendFrame(res, 'open', { sampleRate: STREAM_SAMPLE_RATE })) return undefined
+      }
+      if (frame.kind === 'audio') {
+        if (!sendFrame(res, 'chunk', { audio: frame.bytes.toString('base64'), sampleRate: frame.sampleRate })) {
+          return undefined
+        }
+      } else if (frame.kind === 'ready') {
+        if (!sendFrame(res, 'done', { clip: describe(frame.clip), characters: Number(frame.clip.characters ?? 0) })) {
+          return undefined
+        }
+      }
+    }
+    // 一帧都没产出：这不是错误，但也不是一次成功的流。
+    if (!opened) return sendJson(res, 500, { ok: false, message: '这次合成没有产出任何音频。' })
+    try { res.end() } catch { /* 连接已经断了 */ }
+    return undefined
+  }
 
   /**
-   * 统一的合成出口：分句并行，**首句就绪即返回**，其余交给 `/segments` 续上。
+   * 统一的合成出口：整段文本一次合成、一次返回。
    * @param res - 响应。
    * @param text - 要朗读的文本。
    */
-  const respondSegments = async (res, text) => {
+  const respond = async (res, text) => {
     try {
-      const job = await segments.start(text)
-      sendJson(res, 200, { ok: true, ...describeSegments(segments.get(job.id)) })
+      if (modeOf() === MODE_STREAM) return await streamInto(res, text)
+      const clip = await synth.synthesize(text)
+      return sendJson(res, 200, { ok: true, mode: MODE_ONE_SHOT, clip: describe(clip) })
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       log(`synthesize failed: ${message}`)
-      sendJson(res, 500, { ok: false, message })
+      // 流式可能已经把头发出去了：那时只能在同一条流上报错误，而不能改状态码。
+      if (res.headersSent) {
+        if (sendFrame(res, 'error', { message })) {
+          try { res.end() } catch { /* 连接已经断了 */ }
+        }
+        return undefined
+      }
+      return sendJson(res, 500, { ok: false, message })
     }
   }
 
@@ -215,6 +297,7 @@ export function cosyvoiceRoutes({ getSettings, synth, segments, store, texts, pr
           model: identity.model,
           voiceId: identity.voiceId,
           profileId: identity.profileId ?? '',
+          mode: modeOf(),
           bootSound: settings.bootSound === true,
           dir: store.dir(),
           count: store.count(),
@@ -418,18 +501,7 @@ export function cosyvoiceRoutes({ getSettings, synth, segments, store, texts, pr
         }
         // 客户端给的文本顺手登记，下次点击连 DOM 都不用读。
         if (supplied !== '' && messageId !== '') texts.remember(messageId, supplied)
-        return respondSegments(res, text)
-      },
-    },
-    {
-      // 续上后台还在合成的后续句子。客户端按固定间隔来问，直到 `done`。
-      kind: 'exact',
-      path: `${ROUTE_PREFIX}/segments`,
-      handler(req, res) {
-        const query = new URL(req.url ?? '/', 'http://localhost').searchParams
-        const view = segments.get(query.get('job') ?? '')
-        if (view === undefined) return sendJson(res, 404, { ok: false, message: '没有这个合成任务。' })
-        sendJson(res, 200, { ok: true, ...describeSegments(view) })
+        return respond(res, text)
       },
     },
     {
@@ -441,7 +513,7 @@ export function cosyvoiceRoutes({ getSettings, synth, segments, store, texts, pr
         const body = await readJson(req)
         if (body === undefined) return sendJson(res, 400, { ok: false, message: '请求体不是合法 JSON' })
         const text = typeof body.text === 'string' ? body.text : ''
-        return respondSegments(res, text)
+        return respond(res, text)
       },
     },
     {

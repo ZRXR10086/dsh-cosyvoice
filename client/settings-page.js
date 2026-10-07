@@ -107,6 +107,32 @@ var MINI_BUTTON = {
   cursor: 'pointer',
 }
 
+/** 合成模式切换里的一个按钮。 */
+var MODE_BUTTON = {
+  flex: 'none',
+  padding: '5px 14px',
+  borderRadius: '6px',
+  border: '1px solid ' + T.border,
+  background: 'transparent',
+  color: T.textDim,
+  font: 'inherit',
+  fontSize: '12px',
+  cursor: 'pointer',
+}
+
+/** 模式切换里选中的那一半：用品牌色描边 + 底色，一眼看得出当前是哪种。 */
+var MODE_BUTTON_ACTIVE = {
+  flex: 'none',
+  padding: '5px 14px',
+  borderRadius: '6px',
+  border: '1px solid ' + T.accent,
+  background: T.panel,
+  color: T.text,
+  font: 'inherit',
+  fontSize: '12px',
+  cursor: 'default',
+}
+
 /** 档案名下面那行等宽小字（音色 ID + 模型）。 */
 var PROFILE_META = {
   fontSize: '11px',
@@ -152,6 +178,9 @@ function CosyvoiceSettingsPage(props) {
 
   var value = (snapshot && snapshot.value) || {}
   var hasSecret = !!(snapshot && snapshot.user && typeof snapshot.user === 'object' && 'apiKey' in snapshot.user)
+  // 与宿主同一个归一规则：只有 `stream` 认作实时，写错配置的人得到一个能出声的
+  // 默认值，而不是一片空白。
+  var mode = String(value.mode || '') === 'stream' ? 'stream' : 'one-shot'
 
   var statusState = React.useState(null)
   var status = statusState[0]
@@ -338,20 +367,15 @@ function CosyvoiceSettingsPage(props) {
    */
   function preview() {
     setStatus(null)
-    player.loading('__preview__')
-    rpc('speak', { text: t('settings.previewText') }).then(function (res) {
-      if (res === undefined || !res.ok) {
-        player.stop()
-        setStatus({ kind: 'error', message: (res && res.message) || t('error.generic') })
+    // 试听走的正是播放键那条路：`speakAs` 按服务端模式自己选整段还是流式，所以
+    // 试听也是在验用户真正会用到的那一条链路。
+    speakAs('speak', { text: t('settings.previewText') }, '__preview__').then(function () {
+      var snapshot = player.getSnapshot()
+      if (snapshot.idle === true || snapshot.kind !== 'error') {
+        setStatus({ kind: 'ok', message: t('settings.saved') })
         return
       }
-      if (!Array.isArray(res.segments) || res.segments.length === 0 || !res.segments[0].url) {
-        player.stop()
-        setStatus({ kind: 'error', message: t('error.generic') })
-        return
-      }
-      setStatus({ kind: 'ok', message: t('settings.saved') })
-      player.startQueue('__preview__', res)
+      setStatus({ kind: 'error', message: snapshot.message === undefined ? t('error.generic') : snapshot.message })
     })
   }
 
@@ -381,6 +405,23 @@ function CosyvoiceSettingsPage(props) {
         React.createElement('div', { style: ROW_LABEL }, t(labelKey)),
         React.createElement('div', { style: ROW_BODY }, body)),
       hint === undefined ? null : React.createElement('div', { style: HINT }, hint))
+  }
+
+  /**
+   * 模式切换里的一个按钮。
+   * @param target - 它代表的模式。
+   * @param labelKey - 文案键。
+   * @returns 一个按钮。
+   */
+  function modeButton(target, labelKey) {
+    var active = mode === target
+    return React.createElement('button', {
+      key: target,
+      type: 'button',
+      'aria-pressed': active,
+      style: active ? MODE_BUTTON_ACTIVE : MODE_BUTTON,
+      onClick: function () { write('mode', target) },
+    }, t(labelKey))
   }
 
   /**
@@ -520,6 +561,12 @@ function CosyvoiceSettingsPage(props) {
           write('apiKey', entered)
         },
       }),
+    ]),
+    // 合成方式决定播放键"多久出声"，所以它的位置要在音色档案之前：先看怎么念，
+    // 再看用谁念。
+    row('settings.mode', t('settings.modeHint'), [
+      modeButton('one-shot', 'settings.modeOnce'),
+      modeButton('stream', 'settings.modeStream'),
     ]),
     profilesBlock,
     // 其余字段同样是"失焦即写入"：每敲一个字符都发一次写请求会把 revision 用光，

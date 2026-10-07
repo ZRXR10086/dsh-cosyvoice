@@ -104,23 +104,13 @@ function CosyvoiceSpeakButton(props) {
       return
     }
     if (busy) return
-    player.loading(messageId)
-    rpc('speak-message', {
+    // 说话快慢由服务端定：整段模式等一次合成完再响，实时模式第一句好了就出声。
+    // 两种情况共用这一个入口，因为它按响应的 content-type 自己分岔。
+    speakAs('speak-message', {
       messageId: messageId,
       sessionId: sessionId,
       text: typeof text === 'string' ? text : '',
-    }).then(function (res) {
-      if (res === undefined || !res.ok) {
-        player.fail(messageId, (res && res.message) || t('error.generic'))
-        return
-      }
-      if (!Array.isArray(res.segments) || res.segments.length === 0 || !res.segments[0].url) {
-        player.fail(messageId, t('error.generic'))
-        return
-      }
-      // 首句一就绪就开始播；剩下的句子在后台继续合成，播放器自己会按序接上。
-      player.startQueue(messageId, res)
-    })
+    }, messageId)
   }
 
   var glyph = playing ? React.createElement(IconStop) : busy ? React.createElement(IconBusy) : React.createElement(IconSpeak)

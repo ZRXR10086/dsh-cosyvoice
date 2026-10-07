@@ -98,16 +98,23 @@ var player = (function () {
   var audio = null
 
   /**
-   * 当前播放队列。
-   *
-   * 回答是按句子分段的：首句一就绪就开始播，其余在后台继续合成。队列里存的是
-   * **已经拿到 URL 的那几句**，`done` 说明后面不会再有，`index` 是正在播的那句。
-   * @type {{ messageId: string, jobId: string, segments: Array, done: boolean, index: number, error?: string } | null}
+   * AudioContext：**懒建**。浏览器的自动播放策略要求它在一个用户手势里醒来，而
+   * 播放键的点击正是那个手势 —— 提前建只是多一个 suspended 的上下文。
+   * @type {any}
    */
-  var queue = null
+  var ctx = null
 
-  /** 后台续句的轮询定时器。 */
-  var pollTimer = null
+  /** 已经排上日程、还没播完的音源。 */
+  var sources = []
+
+  /** 下一块音频该在什么时刻开始（相对 AudioContext 自己的时钟）。 */
+  var nextStart = 0
+
+  /**
+   * 正在进行的一次流式播放；`open` 表示后面还会有块过来。
+   * @type {{ messageId: string, open: boolean } | null}
+   */
+  var streaming = null
 
   function emit() {
     for (var i = 0; i < listeners.length; i += 1) listeners[i]()
@@ -123,135 +130,101 @@ var player = (function () {
     emit()
   }
 
-  function clearPoll() {
-    if (pollTimer === null) return
-    clearTimeout(pollTimer)
-    pollTimer = null
-  }
-
-  /** 丢掉队列（停止播放、关掉轮询）。 */
-  function dropQueue() {
-    clearPoll()
-    queue = null
+  /**
+   * 取出 AudioContext，必要时把它叫醒。
+   * @returns AudioContext。
+   */
+  function audioContext() {
+    if (ctx === null) {
+      var Ctor = window.AudioContext === undefined ? window.webkitAudioContext : window.AudioContext
+      if (Ctor === undefined) throw new Error('这个浏览器不支持 Web Audio，请到设置里改用「非实时」模式。')
+      ctx = new Ctor()
+    }
+    // 页面刚打开时它常常是 suspended：resume 一次没有任何副作用。
+    if (ctx.state === 'suspended' && typeof ctx.resume === 'function') ctx.resume()
+    return ctx
   }
 
   /**
-   * 预加载下一句。
+   * 收掉一次流式播放：停掉所有还在排队的音源并把游标拨回当下。
    *
-   * 句间的几百毫秒是最容易被听出来的卡顿，而下一句的 URL 此时通常已经拿到了，
-   * 所以趁现在让浏览器把字节取回来。
-   * @param url - 下一句的地址。
+   * 那些音源是**已经排到未来某刻**的，光 `currentTime` 归零不够 —— 不去 `stop()`
+   * 它们的话，一段听起来已经停了的声音会从半中间重新冒出来。
    */
-  function preload(url) {
-    try {
-      var next = new Audio()
-      next.preload = 'auto'
-      next.src = url
-    } catch (error) {
-      // 预加载失败不影响播放本身：真到那句时会重新取。
-    }
-  }
-
-  /**
-   * 播放队列里的第 index 句。
-   * @param index - 句序号。
-   */
-  function playAt(index) {
-    if (queue === null) return
-    queue.index = index
-
-    if (index >= queue.segments.length) {
-      // 还没合成出来：播完了但还有后续，就停在"合成中"等轮询把新句子接上。
-      if (queue.done) {
-        if (typeof queue.error === 'string' && queue.error !== '') {
-          set({ kind: 'error', messageId: queue.messageId, message: queue.error })
-        } else {
-          set({ idle: true })
-        }
-        dropQueue()
-        return
+  function resetStream() {
+    for (var i = 0; i < sources.length; i += 1) {
+      try {
+        sources[i].onended = null
+        sources[i].stop()
+      } catch (error) {
+        // 已经播完的音源再 stop 一次会抛，无所谓。
       }
-      set({ kind: 'loading', messageId: queue.messageId })
-      schedulePoll(0)
-      return
     }
-
-    var audio = element()
-    audio.pause()
-    audio.src = queue.segments[index].url
-    audio.currentTime = 0
-    set({ kind: 'loading', messageId: queue.messageId })
-    preload(queue.segments[index + 1] === undefined ? undefined : queue.segments[index + 1].url)
-    var started = audio.play()
-    if (started && typeof started.then === 'function') {
-      started.then(function () {
-        // 只有这个队列还在播才更新状态：用户可能已经点停或切到别的消息了。
-        if (queue !== null && queue.index === index) set({ kind: 'playing', messageId: queue.messageId })
-      }).catch(function () {
-        if (queue !== null && queue.index === index) {
-          set({ kind: 'error', messageId: queue.messageId, message: '浏览器拒绝了自动播放，请再点一次' })
-        }
-        dropQueue()
-      })
-    } else {
-      set({ kind: 'playing', messageId: queue.messageId })
-    }
-    audio.onended = function () {
-      if (queue === null || queue.index !== index) return
-      playAt(index + 1)
-    }
-    audio.onerror = function () {
-      if (queue === null || queue.index !== index) return
-      set({ kind: 'error', messageId: queue.messageId, message: '音频播放失败' })
-      dropQueue()
-    }
+    sources = []
+    if (ctx !== null) nextStart = ctx.currentTime
+    streaming = null
   }
 
   /**
-   * 安排一次"去后台取新句子"的轮询。
-   * @param delayMs - 延迟毫秒数。
+   * 把一小块音频排到播放日程上。
+   * @param base64 - Base64 编码的 16 位小端 PCM。
+   * @param sampleRate - 采样率。
    */
-  function schedulePoll(delayMs) {
-    if (queue === null) return
-    clearPoll()
-    pollTimer = setTimeout(function () {
-      pollTimer = null
-      if (queue === null) return
-      rpc('segments?job=' + encodeURIComponent(queue.jobId)).then(function (res) {
-        if (queue === null) return
-        if (res === undefined || !res.ok) {
-          set({ kind: 'error', messageId: queue.messageId, message: (res && res.message) || '语音合成失败' })
-          dropQueue()
-          return
-        }
-        queue.segments = res.segments === undefined ? queue.segments : res.segments
-        queue.done = res.done === true
-        if (typeof res.error === 'string' && res.error !== '') queue.error = res.error
-        // 队列补上了就接着播；还没补上就继续等。
-        if (queue.index < queue.segments.length) playAt(queue.index)
-        else if (queue.done) playAt(queue.index)
-        else schedulePoll(500)
-      })
-    }, delayMs)
+  function feed(base64, sampleRate) {
+    if (streaming === null) return
+    var messageId = streaming.messageId
+    var context = audioContext()
+    var floats = pcmToFloats(base64ToBytes(base64))
+    if (floats.length === 0) return
+
+    var rate = Number(sampleRate)
+    if (!isFinite(rate) || rate <= 0) rate = 24000
+    var buffer = context.createBuffer(1, floats.length, rate)
+    if (typeof buffer.copyToChannel === 'function') buffer.copyToChannel(floats, 0)
+    else buffer.getChannelData(0).set(floats)
+
+    var source = context.createBufferSource()
+    source.buffer = buffer
+    source.connect(context.destination)
+    var startedAt = nextStart < context.currentTime ? context.currentTime : nextStart
+    source.start(startedAt)
+    sources.push(source)
+    // 流式之所以"听不出接缝"，全在这一行：下一块排在**上一块结束的那一刻**（精确
+    // 到采样），而不是"播完再去取下一块"。后者每两句之间都要付一个网络往返，听
+    // 起来就是一顿一顿的。
+    nextStart = startedAt + buffer.duration
+
+    source.onended = function () {
+      var at = sources.indexOf(source)
+      if (at >= 0) sources.splice(at, 1)
+      // 全部播完、且服务端说过不会再有块了，才回到空闲。
+      if (sources.length === 0 && streaming !== null && !streaming.open) set({ idle: true })
+    }
+    set({ kind: 'playing', messageId: messageId })
   }
 
   return {
     /**
-     * 开始播一个分句队列。
+     * 开始一次流式播放。后续每一块音频由 {@link feed} 排上日程。
      * @param messageId - 归属消息。
-     * @param job - 服务端给的作业视图 `{ jobId, segments, done, error }`。
      */
-    startQueue: function (messageId, job) {
-      dropQueue()
-      queue = {
-        messageId: messageId,
-        jobId: String(job.jobId === undefined ? '' : job.jobId),
-        segments: Array.isArray(job.segments) ? job.segments : [],
-        done: job.done === true,
-        index: 0,
-        error: typeof job.error === 'string' ? job.error : undefined,
-      }
-      playAt(0)
+    beginStream: function (messageId) {
+      resetStream()
+      streaming = { messageId: messageId, open: true }
+      nextStart = 0
+      set({ kind: 'loading', messageId: messageId })
+    },
+    /**
+     * 排一块音频上播放日程（见该类里 {@link feed} 的说明）。
+     * @param base64 - Base64 编码的 16 位小端 PCM。
+     * @param sampleRate - 采样率。
+     */
+    feed: feed,
+    /** 服务端不会再有块过来了；播完已排的那些就回到空闲。 */
+    endStream: function () {
+      if (streaming === null) return
+      streaming.open = false
+      if (sources.length === 0) set({ idle: true })
     },
     /** @returns 当前状态快照。 */
     getSnapshot: function () { return state },
@@ -270,7 +243,7 @@ var player = (function () {
      */
     play: function (messageId, url) {
       const audio = element()
-      dropQueue()
+      resetStream()
       audio.pause()
       audio.src = url
       audio.currentTime = 0
@@ -290,10 +263,10 @@ var player = (function () {
         set({ kind: 'error', messageId: messageId, message: '音频播放失败' })
       }
     },
-    /** 停止播放：连同队列与轮询一起收掉。 */
+    /** 停止播放：整段播放与流式播放一起收掉。 */
     stop: function () {
       const audio = element()
-      dropQueue()
+      resetStream()
       audio.pause()
       audio.onended = null
       audio.onerror = null
@@ -304,7 +277,7 @@ var player = (function () {
      * @param messageId - 目标消息。
      */
     loading: function (messageId) {
-      dropQueue()
+      resetStream()
       set({ kind: 'loading', messageId: messageId })
     },
     /**
@@ -317,6 +290,200 @@ var player = (function () {
     },
   }
 })()
+
+/**
+ * Base64 → 字节。
+ *
+ * 手写而不是用 `atob`：一是一段 base64 里混入换行或缺失填充时它会直接抛，二是少
+ * 一个宿主 API，产物自检就少一处环境差异。
+ * @param text - Base64 文本。
+ * @returns 字节。
+ */
+var base64ToBytes = (function () {
+  var table = null
+  var ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+  /**
+   * @param base64 - Base64 文本。
+   * @returns 字节。
+   */
+  return function decode(base64) {
+    if (table === null) {
+      table = {}
+      for (var i = 0; i < ALPHABET.length; i += 1) table[ALPHABET.charAt(i)] = i
+    }
+    var clean = String(base64 === undefined ? '' : base64).replace(/[^A-Za-z0-9+/=]/g, '')
+    var length = clean.length
+    var padding = clean.charAt(length - 2) === '=' ? 2 : clean.charAt(length - 1) === '=' ? 1 : 0
+    var bytes = new Uint8Array(Math.floor((length * 3) / 4) - padding)
+    var at = 0
+    var acc = 0
+    var bits = 0
+    for (var i = 0; i < length; i += 1) {
+      var char = clean.charAt(i)
+      if (char === '=') break
+      acc = (acc << 6) | table[char]
+      bits += 6
+      if (bits >= 8) {
+        bits -= 8
+        bytes[at] = (acc >> bits) & 0xFF
+        at += 1
+      }
+    }
+    return bytes
+  }
+})()
+
+/**
+ * 16 位小端 PCM → WebAudio 要的 Float32（-1 ~ 1）。
+ * @param bytes - 原始采样。
+ * @returns 归一化后的采样。
+ */
+function pcmToFloats(bytes) {
+  var count = Math.floor(bytes.length / 2)
+  var out = new Float32Array(count)
+  for (var i = 0; i < count; i += 1) {
+    var sample = (bytes[i * 2 + 1] << 8) | bytes[i * 2]
+    if (sample >= 32768) sample -= 65536
+    out[i] = sample / 32768
+  }
+  return out
+}
+
+/**
+ * 切出一个 SSE 帧。
+ *
+ * 与宿主 `host/stream.js` 里那份是同一个形状的两份实现 —— 浏览器端的 bundle 不能
+ * 引 Node 模块，而这里也不需要那些 Node 侧的类型。
+ * @param frame - 不含结尾空行的原始帧文本。
+ * @returns `{ event, data }`；没有 data 行时为 undefined。
+ */
+function parseFrame(frame) {
+  var name = ''
+  var lines = []
+  var parts = String(frame).split('\n')
+  for (var i = 0; i < parts.length; i += 1) {
+    var line = parts[i].trim()
+    if (line === '') continue
+    var colon = line.indexOf(':')
+    var key = colon < 0 ? line : line.slice(0, colon).trim()
+    var value = colon < 0 ? '' : line.slice(colon + 1).trim()
+    if (key === 'event') name = value
+    else if (key === 'data') lines.push(value)
+  }
+  if (lines.length === 0) return undefined
+  return { event: name, data: lines.join('\n') }
+}
+
+/**
+ * 读一条 SSE 流，逐个事件交给回调。
+ * @param body - 响应体（StreamReader 的宿主）。
+ * @param onFrame - 每帧回调。
+ * @returns 流结束时的 Promise。
+ */
+async function readSseFrames(body, onFrame) {
+  var decoder = new TextDecoder()
+  var reader = body.getReader()
+  var buffer = ''
+  while (true) {
+    var next = await reader.read()
+    if (next.done) break
+    buffer += decoder.decode(next.value, { stream: true })
+    // TCP 不保证一次读到整帧，所以留下尾巴等下一趟。
+    var at = buffer.indexOf('\n\n')
+    while (at >= 0) {
+      var frame = parseFrame(buffer.slice(0, at))
+      buffer = buffer.slice(at + 2)
+      if (frame !== undefined) onFrame(frame)
+      at = buffer.indexOf('\n\n')
+    }
+  }
+  if (buffer.trim() !== '') {
+    var tail = parseFrame(buffer)
+    if (tail !== undefined) onFrame(tail)
+  }
+}
+
+/**
+ * 请求一次朗读并把结果交给播放器。
+ *
+ * 服务端按自己的配置决定回整段 JSON 还是 SSE 流，这里不先去问 `mode` —— 少一次
+ * 往返，而 `content-type` 已经是唯一的真相来源：模式可能在两次请求之间被改掉，问
+ * 来的答案反而可能是过期的。
+ * @param action - 插件前缀下的路由名。
+ * @param body - JSON body。
+ * @param messageId - 归属消息，用于把状态落在正确的按钮上。
+ * @returns 处理完毕的 Promise。
+ */
+async function speakAs(action, body, messageId) {
+  player.loading(messageId)
+  var response
+  try {
+    response = await fetch(ROUTE_PREFIX + '/' + action, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body === undefined ? {} : body),
+    })
+  } catch (error) {
+    player.fail(messageId, String(error))
+    return
+  }
+
+  var type = response.headers === undefined || response.headers === null
+    ? ''
+    : String(response.headers.get('content-type') || '')
+
+  if (type.indexOf('text/event-stream') >= 0) {
+    if (response.body === undefined || response.body === null || typeof response.body.getReader !== 'function') {
+      player.fail(messageId, '这个浏览器读不了流式响应，请在设置里改用「非实时」模式。')
+      return
+    }
+    player.beginStream(messageId)
+    try {
+      await readSseFrames(response.body, function (frame) {
+        var data = {}
+        try { data = JSON.parse(frame.data) } catch (error) { data = {} }
+        if (frame.event === 'chunk') {
+          try {
+            player.feed(data.audio, data.sampleRate)
+          } catch (error) {
+            player.fail(messageId, String(error))
+          }
+        } else if (frame.event === 'done') {
+          player.endStream()
+        } else if (frame.event === 'error') {
+          player.fail(messageId, data.message === undefined ? '语音合成失败' : data.message)
+        }
+      })
+    } catch (error) {
+      player.fail(messageId, String(error))
+    }
+    return
+  }
+
+  var text = ''
+  try {
+    text = await response.text()
+  } catch (error) {
+    player.fail(messageId, String(error))
+    return
+  }
+  var payload
+  try {
+    payload = text === '' ? { ok: response.ok } : JSON.parse(text)
+  } catch (error) {
+    player.fail(messageId, '返回内容不是合法 JSON')
+    return
+  }
+  if (payload === undefined || payload === null || !payload.ok) {
+    player.fail(messageId, (payload !== null && payload !== undefined && payload.message) || '语音合成失败')
+    return
+  }
+  if (payload.clip === undefined || payload.clip === null || !payload.clip.url) {
+    player.fail(messageId, '语音合成失败')
+    return
+  }
+  player.play(messageId, payload.clip.url)
+}
 
 /**
  * 订阅播放器状态。
