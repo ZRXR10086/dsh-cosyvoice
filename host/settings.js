@@ -1,0 +1,44 @@
+/**
+ * `cosyvoice` 设置命名空间：本插件的全部配置面。
+ *
+ * 注册在宿主侧，所以 DSH 会把它持久化进用户设置文档（`$DSH_HOME/settings.yaml`），
+ * 保持可手工编辑 —— 这也是字段名取朴素名字、每个默认值都能独立使用的原因。
+ *
+ * `apiKey` 带 `role('secret')`：每一条发往浏览器的通道都会把它剥离，
+ * 所以页面只能知道"是否已配置"，永远读不到明文。写入仍然可用，因为设置通道
+ * 写的是**按路径的增量编辑**，而不是重述整份文档。
+ *
+ * schema 是工厂函数而非常量，因为 schemastery 要在 apply 时从 harness 安装处
+ * 解析（见 `./harness.js`）；在模块作用域 import 它会重新引入那个会破坏
+ * 本地路径安装的裸 import。
+ * @module dsh-cosyvoice/settings
+ */
+
+/** 本插件拥有的设置命名空间（小写，DSH 要求）。 */
+export const VOICE_NAMESPACE = 'cosyvoice'
+
+/** 默认合成模型。必须与音色注册时使用的模型一致。 */
+export const DEFAULT_MODEL = 'cosyvoice-v3.5-plus'
+
+/** 承载百炼 API Key 的字段。密钥：在所有通道上脱敏。 */
+export const API_KEY_FIELD = 'apiKey'
+
+/**
+ * 构建持久化的语音设置 schema。
+ * @param z - schemastery 入口，从 harness 安装处解析。
+ * @returns 为 {@link VOICE_NAMESPACE} 注册的 schema。
+ */
+export function voiceSettingsSchema(z) {
+  return z.object({
+    /** 阿里云百炼 API Key（`sk-...`）。密钥字段。 */
+    apiKey: z.string().role('secret').default(''),
+    /** 合成模型；与音色注册模型不一致会让引擎直接拒绝请求。 */
+    model: z.string().default(DEFAULT_MODEL),
+    /** 百炼控制台里的复刻/设计音色 ID。 */
+    voiceId: z.string().default(''),
+    /** 合成音频的落盘目录。留空表示使用插件自己在 harness home 下的目录。 */
+    outputDir: z.string().default(''),
+    /** 打开页面后首次交互时播放一次提示音。 */
+    bootSound: z.boolean().default(true),
+  })
+}
